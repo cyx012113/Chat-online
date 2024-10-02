@@ -1,5 +1,6 @@
 # Chat-online 4.2.6：
 - 更新了字体。
+- 修复无法关闭窗口的问题。
 # Chat-online 4.2.3：
 - 更新了服务器的界面，添加了按钮；
 - 更新了语言，增加英语。
@@ -15,6 +16,7 @@
 
 # Chat-online 4.2.6：
 - Updated fonts.
+- Fix the problem of not being able to close the window.
 # Chat-online 4.2.3：
 - Updated the server interface and added buttons;
 - Updated the language to include English.
