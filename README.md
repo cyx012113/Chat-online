@@ -1,3 +1,7 @@
+### 建议 Advice
+各个版本功能、通信协议不同，为了保证功能完整性，请勿使用不同版本的应用进行通信。
+Each version has different functions and communication protocols, in order to ensure the integrity of the function, please do not use different versions of the application to communicate.
+
 # Chat-online 4.2.6：
 - 更新了字体。
 - 修复无法关闭窗口的问题。
