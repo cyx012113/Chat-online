@@ -36,18 +36,18 @@ Certain features of this program are only supported on Windows systems. Function
 ### Chat-online 1.0.0（未发布）：
 - 控制台版本。
 
-### Chat-online 5.0.0:
-- Added window flashing.
-- Added private chat and group chat, categorized into main groups (all members), sub-groups (select members), and private chats (two participants).
-- Added file sending and downloading functionality.
-- Added emoji sending functionality.
-- Added link sending functionality.
-- Implemented server owners, group owners, and administrators: Server owners manage group chats; group owners and administrators manage group members.
-- Added language switching between Chinese and English.
-- Added light/dark theme switching.
-- Added IP (range) blocking functionality.
-- Supported switching between group chats.
-- Compatible with operating systems other than Windows.
+Chat-online 5.0.0:
+- Added window flashing;
+- Added private chat and group chat, categorized into main groups (all members), sub-groups (select members), and private chats (two participants);
+- Added file sending and downloading functionality;
+- Added emoji sending functionality;
+- Added link sending functionality;
+- Implemented server owners, group owners, and administrators: Server owners manage group chats; group owners and administrators manage group members;
+- Added language switching between Chinese and English;
+- Added light/dark theme switching;
+- Added IP (range) blocking functionality;
+- Supported switching between group chats;
+- Compatible with operating systems other than Windows;
 - Updated interface and optimized operation methods.
 ### Chat-online 4.2.6：
 - Updated fonts.
