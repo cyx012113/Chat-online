@@ -1,16 +1,24 @@
 ### 建议 Advice
 各个版本功能、通信协议不同，为了保证功能完整性，请勿使用不同版本的应用进行通信。
+
+本程序的某些功能仅在 Windows 系统上被支持，在其他操作系统使用无法保证功能完整性。
+
 Each version has different functions and communication protocols, in order to ensure the integrity of the function, please do not use different versions of the application to communicate.
+
+Certain features of this program are only supported on Windows systems. Functionality cannot be guaranteed when used on other operating systems.
 
 ### Chat-online 5.0.0：
 - 增加了窗口闪动；
-- 增加了私聊、群聊；
+- 增加了私聊、群聊，分为主群（所有人）和小群（部分人）、私聊（两个人）；
 - 增加了发送、下载文件功能；
 - 增加了发送表情功能；
 - 增加了发送链接功能；
 - 设置了服主、群主、管理员，服主可以管理群聊，群主、管理员可以管理群内成员；
 - 增加了中英文切换功能；
 - 增加了亮暗主题切换功能；
+- 增加了封禁 IP（段）的功能；
+- 支持了群聊切换；
+- 兼容了除 Windows 外的操作系统；
 - 更新了界面，优化操作方式。
 ### Chat-online 4.2.6：
 - 更新了字体；
@@ -28,15 +36,18 @@ Each version has different functions and communication protocols, in order to en
 ### Chat-online 1.0.0（未发布）：
 - 控制台版本。
 
-Chat-online 5.0.0:
+### Chat-online 5.0.0:
 - Added window flashing.
-- Added private chat and group chat.
-- Added file sending and downloading.
-- Added emoji sending.
-- Added link sending.
+- Added private chat and group chat, categorized into main groups (all members), sub-groups (select members), and private chats (two participants).
+- Added file sending and downloading functionality.
+- Added emoji sending functionality.
+- Added link sending functionality.
 - Implemented server owners, group owners, and administrators: Server owners manage group chats; group owners and administrators manage group members.
 - Added language switching between Chinese and English.
 - Added light/dark theme switching.
+- Added IP (range) blocking functionality.
+- Supported switching between group chats.
+- Compatible with operating systems other than Windows.
 - Updated interface and optimized operation methods.
 ### Chat-online 4.2.6：
 - Updated fonts.
