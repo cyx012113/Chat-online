@@ -9,6 +9,11 @@ Each version has different functions and communication protocols, in order to en
 
 Certain features of this program are only supported on Windows systems. Functionality cannot be guaranteed when used on other operating systems.
 
+### Chat-online 5.1.0：
+- 将客户端与服务器端代码合并为单一程序，可通过启动参数或界面选择运行模式；
+- 优化群组列表解析逻辑，修复了因服务器返回额外信息（如 PermissionInfo）导致客户端群组列表显示异常的问题；
+- 修复调整窗口透明度后主题颜色未能及时刷新的问题；
+- 移除部分未使用的代码，提升程序稳定性与可维护性。
 ### Chat-online 5.0.0：
 - 增加了窗口闪动；
 - 增加了私聊、群聊，分为主群（所有人）和小群（部分人）、私聊（两个人）；
@@ -38,7 +43,12 @@ Certain features of this program are only supported on Windows systems. Function
 ### Chat-online 1.0.0（未发布）：
 - 控制台版本。
 
-Chat-online 5.0.0:
+### Chat-online 5.1.0:
+- Merged client and server code into a single program, allowing selection of running mode via command-line arguments or interface;
+- Optimized group list parsing logic, fixed the issue where the client displayed incorrect group entries due to extra information (e.g., PermissionInfo) from the server;
+- Fixed the issue where theme colors did not update immediately after adjusting window transparency;
+- Removed some unused code, improving stability and maintainability.
+### Chat-online 5.0.0:
 - Added window flashing;
 - Added private chat and group chat, categorized into main groups (all members), sub-groups (select members), and private chats (two participants);
 - Added file sending and downloading functionality;

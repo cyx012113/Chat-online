@@ -1,8 +1,9 @@
 import socket
 import threading
 import tkinter as tk
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox, simpledialog, filedialog
 from tkinter import font as tkFont
+from tkinter import ttk
 import os
 import base64
 import json
@@ -11,27 +12,20 @@ import string
 import time
 import sys
 import platform
+import datetime
+import re
+import webbrowser
 
 # 检测操作系统
 IS_WINDOWS = platform.system() == 'Windows'
 IS_LINUX = platform.system() == 'Linux'
 IS_MACOS = platform.system() == 'Darwin'
 
-# 尝试导入全局热键监控库
-try:
-    from pynput import keyboard, mouse
-    HAS_PYNPUT = True
-except ImportError:
-    HAS_PYNPUT = False
-    if not IS_WINDOWS:
-        print("提示: pynput库在某些系统上可能需要额外权限。可以使用 'pip install pynput' 安装。")
-    else:
-        print("警告: 未安装pynput库，全局热键功能将不可用。可以使用 'pip install pynput' 安装。")
-
 class ChatServer:
-    def __init__(self, master):
+    def __init__(self, master, port=8888):
         self.master = master
         self.master.title("聊天服务器 Chat Server")
+        self.port = port  # 保存端口号
         self.sock = None
         self.start = False
         self.clients = []
@@ -77,62 +71,136 @@ class ChatServer:
         self.theme = "light"
         self.translations = self.load_translations()
         self.setup_widgets()
+        self.file_storage_base = os.path.join(os.getcwd(), "chat_data")
+        if not os.path.exists(self.file_storage_base):
+            os.makedirs(self.file_storage_base)
+
+    def get_chat_storage_path(self, chat_key, chat_name, msg_type="group"):
+        """获取聊天存储路径"""
+        # 清理名称中的非法字符
+        safe_name = "".join(c for c in chat_name if c.isalnum() or c in ('_', '-', ' '))
+        safe_name = safe_name.replace(' ', '_')
+        
+        if msg_type == "group":
+            folder_name = f"group_{safe_name}_{int(time.time())}"
+        else:  # private
+            folder_name = f"private_{safe_name}_{int(time.time())}"
+        
+        folder_path = os.path.join(self.file_storage_base, folder_name)
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+        
+        json_file = os.path.join(folder_path, f"{safe_name}.json")
+        files_folder = os.path.join(folder_path, "files")
+        if not os.path.exists(files_folder):
+            os.makedirs(files_folder)
+        
+        return folder_path, json_file, files_folder
 
     def setup_widgets(self):
         if IS_WINDOWS:
-            font_family = "华文楷体"
+            font_family = "Microsoft YaHei UI"
         elif IS_MACOS:
             font_family = "PingFang SC"
         else:
             font_family = "DejaVu Sans"
-        font = tkFont.Font(family=font_family, size=11)
+        font = tkFont.Font(family=font_family, size=10)
+        title_font = tkFont.Font(family=font_family, size=11, weight='bold')
+        
+        # 配置ttk样式
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('Title.TLabel', font=title_font, background='#f0f0f0')
+        style.configure('Status.TLabel', font=font, background='#ffffff')
+        style.configure('Action.TButton', font=font, padding=8)
+        
         self.create_menu_bar()
-        self.master.geometry("1200x700")
-        self.master.minsize(1000, 600)
-        status_frame = tk.Frame(self.master, relief=tk.RAISED, borderwidth=1)
+        self.master.geometry("1400x800")
+        self.master.minsize(1200, 700)
+        
+        # 状态栏 - 使用ttk Frame
+        status_frame = ttk.Frame(self.master, style='Title.TFrame')
         status_frame.grid(row=0, column=0, columnspan=5, sticky="ew", padx=5, pady=5)
+        status_frame.configure(relief=tk.RAISED, borderwidth=1)
+        
         server_ip = socket.gethostbyname(socket.gethostname())
-        self.status_label = tk.Label(status_frame, text=f"服务器IP: {server_ip} | 端口: 8888 | 状态: 未启动", font=font, anchor="w")
-        self.status_label.pack(side=tk.LEFT, padx=10, pady=5)
-        self.start_button = tk.Button(status_frame, text="▶ 启动服务器", command=self.start_server, font=font, bg="#4CAF50", fg="white", relief=tk.RAISED, padx=15, pady=5, cursor="hand2")
-        self.start_button.pack(side=tk.RIGHT, padx=10, pady=5)
-        msg_frame = tk.LabelFrame(self.master, text="服务器日志 Server Log", font=font, padx=5, pady=5)
+        self.status_label = ttk.Label(status_frame, text=f"服务器IP: {server_ip} | 端口: {self.port} | 状态: 未启动", 
+                                      font=font, anchor="w", style='Status.TLabel')
+        self.status_label.pack(side=tk.LEFT, padx=15, pady=8)
+        
+        self.start_button = ttk.Button(status_frame, text="▶ 启动服务器", command=self.start_server, 
+                                      style='Action.TButton', cursor="hand2")
+        self.start_button.pack(side=tk.RIGHT, padx=15, pady=8)
+        
+        # 消息日志区域 - 使用ttk LabelFrame
+        msg_frame = ttk.LabelFrame(self.master, text="服务器日志 Server Log", padding=10)
         msg_frame.grid(row=1, column=0, columnspan=3, sticky="nsew", padx=5, pady=5)
-
-        self.messages = tk.Text(msg_frame, state='disabled', font=font, wrap=tk.WORD, relief=tk.SUNKEN, borderwidth=2)
-        scrollbar_msg = tk.Scrollbar(msg_frame, orient=tk.VERTICAL, command=self.messages.yview)
+        
+        # 使用ttk Scrollbar
+        msg_scroll_frame = tk.Frame(msg_frame)
+        msg_scroll_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.messages = tk.Text(msg_scroll_frame, state='disabled', font=font, wrap=tk.WORD, 
+                                relief=tk.SUNKEN, borderwidth=1, bg='#ffffff', fg='#333333',
+                                selectbackground='#4A90E2', selectforeground='white')
+        scrollbar_msg = ttk.Scrollbar(msg_scroll_frame, orient=tk.VERTICAL, command=self.messages.yview)
         self.messages.config(yscrollcommand=scrollbar_msg.set)
         self.messages.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar_msg.pack(side=tk.RIGHT, fill=tk.Y)
 
-        input_frame = tk.Frame(self.master)
+        # 输入区域
+        input_frame = ttk.Frame(self.master)
         input_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
-        self.input_server = tk.Entry(input_frame, font=font, relief=tk.SUNKEN, borderwidth=2)
+        
+        self.input_server = ttk.Entry(input_frame, font=font)
         self.input_server.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        self.send_button = tk.Button(input_frame, text="发送", command=self.send_server_message, font=font, bg="#2196F3", fg="white", relief=tk.RAISED, padx=20, pady=5, cursor="hand2")
+        
+        self.send_button = ttk.Button(input_frame, text="发送", command=self.send_server_message, 
+                                     style='Action.TButton', cursor="hand2")
         self.send_button.pack(side=tk.RIGHT)
 
-        user_frame = tk.LabelFrame(self.master, text="在线用户 Online Users", font=font, padx=5, pady=5)
+        # 用户列表 - 使用ttk LabelFrame
+        user_frame = ttk.LabelFrame(self.master, text="在线用户 Online Users", padding=10)
         user_frame.grid(row=1, column=3, rowspan=2, sticky="nsew", padx=5, pady=5)
-        self.client_listbox = tk.Listbox(user_frame, font=font, relief=tk.SUNKEN, borderwidth=2)
-        scrollbar_user = tk.Scrollbar(user_frame, orient=tk.VERTICAL, command=self.client_listbox.yview)
+        
+        user_scroll_frame = tk.Frame(user_frame)
+        user_scroll_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.client_listbox = tk.Listbox(user_scroll_frame, font=font, relief=tk.SUNKEN, borderwidth=1,
+                                        bg='#ffffff', fg='#333333', selectbackground='#4A90E2', 
+                                        selectforeground='white')
+        scrollbar_user = ttk.Scrollbar(user_scroll_frame, orient=tk.VERTICAL, command=self.client_listbox.yview)
         self.client_listbox.config(yscrollcommand=scrollbar_user.set)
         self.client_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar_user.pack(side=tk.RIGHT, fill=tk.Y)
 
-        group_frame = tk.LabelFrame(self.master, text="群聊列表 Group List", font=font, padx=5, pady=5)
+        # 群组列表 - 使用ttk LabelFrame
+        group_frame = ttk.LabelFrame(self.master, text="群聊列表 Group List", padding=10)
         group_frame.grid(row=1, column=4, rowspan=2, sticky="nsew", padx=5, pady=5)
-        self.group_listbox = tk.Listbox(group_frame, font=font, relief=tk.SUNKEN, borderwidth=2)
-        scrollbar_group = tk.Scrollbar(group_frame, orient=tk.VERTICAL, command=self.group_listbox.yview)
+        
+        group_scroll_frame = tk.Frame(group_frame)
+        group_scroll_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.group_listbox = tk.Listbox(group_scroll_frame, font=font, relief=tk.SUNKEN, borderwidth=1,
+                                       bg='#ffffff', fg='#333333', selectbackground='#4A90E2', 
+                                       selectforeground='white')
+        scrollbar_group = ttk.Scrollbar(group_scroll_frame, orient=tk.VERTICAL, command=self.group_listbox.yview)
         self.group_listbox.config(yscrollcommand=scrollbar_group.set)
         self.group_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar_group.pack(side=tk.RIGHT, fill=tk.Y)
 
-        file_frame = tk.LabelFrame(self.master, text="文件列表 Files", font=font, padx=5, pady=5)
+        # 文件列表 - 使用ttk LabelFrame
+        file_frame = ttk.LabelFrame(self.master, text="文件列表 Files", padding=10)
         file_frame.grid(row=3, column=0, columnspan=5, sticky="nsew", padx=5, pady=5)
-        self.file_listbox = tk.Listbox(file_frame, font=font, height=8, relief=tk.SUNKEN, borderwidth=2)
+        
+        file_scroll_frame = tk.Frame(file_frame)
+        file_scroll_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.file_listbox = tk.Listbox(file_scroll_frame, font=font, height=8, relief=tk.SUNKEN, borderwidth=1,
+                                      bg='#ffffff', fg='#333333', selectbackground='#4A90E2', 
+                                      selectforeground='white')
         self.file_listbox.bind("<Double-Button-1>", self.view_file_info)
-        scrollbar_file = tk.Scrollbar(file_frame, orient=tk.VERTICAL, command=self.file_listbox.yview)
+        scrollbar_file = ttk.Scrollbar(file_scroll_frame, orient=tk.VERTICAL, command=self.file_listbox.yview)
         self.file_listbox.config(yscrollcommand=scrollbar_file.set)
         self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar_file.pack(side=tk.RIGHT, fill=tk.Y)
@@ -199,20 +267,160 @@ class ChatServer:
         self.master.bind("<Control-s>", lambda e: self.start_server())
         self.master.bind("<Control-q>", lambda e: self.on_close())
 
+    def show_group_management_gui(self, group_id):
+        """显示群聊管理GUI"""
+        if group_id not in self.groups:
+            return
+        
+        group = self.groups[group_id]
+        
+        # 检查权限
+        if not self.has_group_manage_permission(None, group_id):
+            messagebox.showerror("错误", "你没有管理此群组的权限")
+            return
+        
+        manage_window = tk.Toplevel(self.master)
+        manage_window.title(f"管理群组: {group['name']}")
+        manage_window.geometry("500x400")
+        
+        # 群组信息框架
+        info_frame = tk.LabelFrame(manage_window, text="群组信息")
+        info_frame.pack(fill="x", padx=10, pady=5)
+        
+        tk.Label(info_frame, text=f"群组名称: {group['name']}").pack(anchor="w")
+        tk.Label(info_frame, text=f"群组ID: {group_id}").pack(anchor="w")
+        tk.Label(info_frame, text=f"邀请码: {group['invite_code']}").pack(anchor="w")
+        
+        # 修改群名
+        name_frame = tk.Frame(manage_window)
+        name_frame.pack(fill="x", padx=10, pady=5)
+        
+        tk.Label(name_frame, text="新群名:").pack(side="left")
+        new_name_entry = tk.Entry(name_frame)
+        new_name_entry.pack(side="left", fill="x", expand=True, padx=5)
+        new_name_entry.insert(0, group['name'])
+        
+        def change_group_name_local():
+            new_name = new_name_entry.get().strip()
+            if new_name:
+                self.change_group_name(group_id, new_name)
+                manage_window.destroy()
+        
+        tk.Button(name_frame, text="修改群名", command=change_group_name_local).pack(side="right")
+        
+        # 成员管理框架
+        member_frame = tk.LabelFrame(manage_window, text="成员管理")
+        member_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        # 成员列表
+        member_listbox = tk.Listbox(member_frame)
+        member_listbox.pack(side="left", fill="both", expand=True)
+        
+        # 刷新成员列表
+        def refresh_member_list():
+            member_listbox.delete(0, tk.END)
+            for member in group['members']:
+                if member in self.client_names:
+                    member_name = self.client_names[member]
+                    role = "群主" if member == group.get('owner') else "管理员" if member in group.get('admins', set()) else "成员"
+                    member_listbox.insert(tk.END, f"{member_name} ({role})")
+        
+        refresh_member_list()
+        
+        # 管理按钮框架
+        button_frame = tk.Frame(member_frame)
+        button_frame.pack(side="right", fill="y")
+        
+        def kick_selected():
+            selected = member_listbox.curselection()
+            if selected:
+                member_info = member_listbox.get(selected[0])
+                member_name = member_info.split(' (')[0]
+                self.kick_from_group_dialog(group_id, group['name'], member_name)
+                refresh_member_list()
+        
+        def mute_selected():
+            selected = member_listbox.curselection()
+            if selected:
+                member_info = member_listbox.get(selected[0])
+                member_name = member_info.split(' (')[0]
+                self.mute_from_group_dialog(group_id, group['name'], member_name)
+        
+        def unmute_selected():
+            selected = member_listbox.curselection()
+            if selected:
+                member_info = member_listbox.get(selected[0])
+                member_name = member_info.split(' (')[0]
+                self.unmute_from_group_dialog(group_id, group['name'], member_name)
+        
+        def set_admin_selected():
+            selected = member_listbox.curselection()
+            if selected:
+                member_info = member_listbox.get(selected[0])
+                member_name = member_info.split(' (')[0]
+                self.set_group_admin_dialog(group_id, group['name'], member_name)
+                refresh_member_list()
+        
+        def remove_admin_selected():
+            selected = member_listbox.curselection()
+            if selected:
+                member_info = member_listbox.get(selected[0])
+                member_name = member_info.split(' (')[0]
+                self.remove_group_admin_dialog(group_id, group['name'], member_name)
+                refresh_member_list()
+        
+        def delete_group():
+            if messagebox.askyesno("确认", f"确定要删除群组 {group['name']} 吗？"):
+                self.delete_group_dialog(group_id)
+                manage_window.destroy()
+        
+        tk.Button(button_frame, text="踢出成员", command=kick_selected).pack(fill="x", pady=2)
+        tk.Button(button_frame, text="禁言成员", command=mute_selected).pack(fill="x", pady=2)
+        tk.Button(button_frame, text="解禁成员", command=unmute_selected).pack(fill="x", pady=2)
+        tk.Button(button_frame, text="设为管理员", command=set_admin_selected).pack(fill="x", pady=2)
+        tk.Button(button_frame, text="移除管理员", command=remove_admin_selected).pack(fill="x", pady=2)
+        tk.Button(button_frame, text="删除群组", command=delete_group, bg="red", fg="white").pack(fill="x", pady=2)
+        
+        tk.Button(manage_window, text="关闭", command=manage_window.destroy).pack(pady=10)
+
+    def change_group_name(self, group_id, new_name):
+        """修改群组名称"""
+        if group_id in self.groups:
+            old_name = self.groups[group_id]['name']
+            self.groups[group_id]['name'] = new_name
+            
+            # 通知所有群成员
+            notice_msg = f"群组名称已从 {old_name} 改为 {new_name}。Group name changed from {old_name} to {new_name}."
+            group = self.groups[group_id]
+            for member in group['members']:
+                try:
+                    member.sendall(notice_msg.encode('utf-8'))
+                except:
+                    pass
+            
+            # 更新群组列表
+            self.broadcast_group_list_update()
+            
+            # 服务器日志
+            self.messages.configure(state='normal')
+            self.messages.insert(tk.END, f"[系统] 群组 {group_id} 名称已修改: {old_name} -> {new_name}\n")
+            self.messages.configure(state='disabled')
+            self.messages.yview(tk.END)
+
     def start_server(self):
         if self.start == True:
             messagebox.showerror("服务器已启动 The server is up", "服务器已启动，请勿重复启动服务器！The server has been started, do not start the server repeatedly!")
             return
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.bind(('0.0.0.0', 8888))
+        self.sock.bind(('0.0.0.0', self.port))  # 使用配置的端口
         self.sock.listen(1000)
         threading.Thread(target=self.accept_connections, daemon=True).start()
         self.start = True
         self.start_button.pack_forget()
         server_ip = socket.gethostbyname(socket.gethostname())
-        self.status_label.config(text=f"服务器IP: {server_ip} | 端口: 8888 | 状态: ✓ 运行中")
+        self.status_label.config(text=f"服务器IP: {server_ip} | 端口: {self.port} | 状态: ✓ 运行中")
         self.messages.configure(state='normal')
-        self.messages.insert(tk.END, f"[系统] 服务器已启动，监听地址: 0.0.0.0:8888\n")
+        self.messages.insert(tk.END, f"[系统] 服务器已启动，监听地址: 0.0.0.0:{self.port}\n")
         self.messages.configure(state='disabled')
         self.messages.yview(tk.END)
 
@@ -325,6 +533,8 @@ class ChatServer:
                 elif message.startswith("/name "):
                     self.client_names[client] = message.split()[1]
                     self.update_client_list()
+                    # 新用户连接时发送主群历史消息
+                    self.send_message_history(client, self.main_group_id, "group")
                 elif message.startswith("/creategroup "):
                     group_name = message[13:].strip()
                     if group_name:
@@ -1117,19 +1327,19 @@ class ChatServer:
             'datetime': datetime.datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
         }
         
+        # 获取存储路径
+        folder_path, json_file, files_folder = self.get_chat_storage_path(chat_key, chat_name, msg_type)
+        
         # 初始化消息历史
         if chat_key not in self.message_history:
             self.message_history[chat_key] = []
         
         self.message_history[chat_key].append(msg_data)
         
-        # 获取或创建JSON文件
-        filename, filepath = self.get_chat_json_filename(chat_key, chat_name, msg_type)
-        
         # 读取现有数据或创建新数据
-        if os.path.exists(filepath):
+        if os.path.exists(json_file):
             try:
-                with open(filepath, 'r', encoding='utf-8') as f:
+                with open(json_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
             except:
                 data = {
@@ -1152,10 +1362,12 @@ class ChatServer:
         
         # 保存到文件
         try:
-            with open(filepath, 'w', encoding='utf-8') as f:
+            with open(json_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"保存消息到JSON失败: {e}")
+        
+        return folder_path, files_folder
     
     def load_message_history(self, chat_key):
         """从JSON文件加载消息历史"""
@@ -1288,6 +1500,9 @@ class ChatServer:
                     
                     success_msg = f"/joinedgroup {group_id} {group['name']}"
                     client.sendall(success_msg.encode('utf-8'))
+                    
+                    # 发送历史消息给新成员
+                    self.send_message_history(client, group_id, "group")
                     
                     # 通知群组其他成员
                     join_notice = f"用户 {client_name} 加入了群组 {group['name']}。User {client_name} joined group {group['name']}."
@@ -2059,116 +2274,42 @@ class ChatServer:
         target_user = json_msg.get('target')
         file_name = json_msg.get('filename')
         file_data = json_msg.get('data')
-        group_id = json_msg.get('group_id')  # 如果指定了群组
+        group_id = json_msg.get('group_id')
         
         # 保存文件到服务器（仅群聊文件）
         if not target_user and group_id:
-            import time
-            file_id = f"{group_id}_{int(time.time())}_{file_name}"
-            file_path = os.path.join(self.file_storage_path, file_id)
-            try:
-                file_bytes = base64.b64decode(file_data)
-                with open(file_path, 'wb') as f:
-                    f.write(file_bytes)
-                self.stored_files[file_id] = {
-                    'filename': file_name,
-                    'path': file_path,
-                    'sender': sender_name,
-                    'group_id': group_id,
-                    'timestamp': time.time()
-                }
-                # 广播文件列表更新
-                self.broadcast_file_list_update(group_id)
-                # 刷新服务器端文件列表
-                self.refresh_file_list()
-            except Exception as e:
-                print(f"保存文件失败: {e}")
-        
-        if target_user:
-            # 私聊文件
-            target_client = None
-            for client, name in self.client_names.items():
-                if name == target_user:
-                    target_client = client
-                    break
-            
-            if target_client:
-                json_msg['sender'] = sender_name
-                json_msg['type'] = 'file_private'
-                target_client.sendall(json.dumps(json_msg).encode('utf-8'))
-                # 给发送者发送确认消息（不包含文件数据）
-                confirm_msg = {
-                    'type': 'file_private',
-                    'sender': sender_name,
-                    'target': target_user,
-                    'filename': file_name,
-                    'status': 'sent'
-                }
-                sender_client.sendall(json.dumps(confirm_msg).encode('utf-8'))
-                # 服务器日志只显示文件名和大小信息
-                file_size = len(base64.b64decode(file_data)) if file_data else 0
-                self.messages.configure(state='normal')
-                self.messages.insert(tk.END, f"[私聊文件] {sender_name} -> {target_user}: {file_name} ({file_size} bytes)\n")
-                self.messages.configure(state='disabled')
-                self.messages.yview(tk.END)
-        elif group_id and group_id in self.groups:
-            # 发送到指定群组
-            json_msg['sender'] = sender_name
-            json_msg['type'] = 'file_group'
-            group = self.groups[group_id]
-            for client in group['members']:
-                if client != sender_client:
-                    try:
-                        client.sendall(json.dumps(json_msg).encode('utf-8'))
-                    except:
-                        pass
-            # 服务器日志只显示文件名和大小信息
-            file_size = len(base64.b64decode(file_data)) if file_data else 0
-            self.messages.configure(state='normal')
-            self.messages.insert(tk.END, f"[{group['name']}文件] {sender_name}: {file_name} ({file_size} bytes)\n")
-            self.messages.configure(state='disabled')
-            self.messages.yview(tk.END)
-        else:
-            # 发送到当前群组
-            current_group_id = self.client_current_group.get(sender_client, self.main_group_id)
-            json_msg['sender'] = sender_name
-            json_msg['type'] = 'file_group'
-            if current_group_id in self.groups:
-                group = self.groups[current_group_id]
-                for client in group['members']:
-                    if client != sender_client:
-                        try:
-                            client.sendall(json.dumps(json_msg).encode('utf-8'))
-                        except:
-                            pass
-                # 保存文件到服务器（当前群组文件）
-                if not target_user:
-                    import time
-                    file_id = f"{current_group_id}_{int(time.time())}_{file_name}"
-                    file_path = os.path.join(self.file_storage_path, file_id)
-                    try:
-                        file_bytes = base64.b64decode(file_data)
-                        with open(file_path, 'wb') as f:
-                            f.write(file_bytes)
-                        self.stored_files[file_id] = {
-                            'filename': file_name,
-                            'path': file_path,
-                            'sender': sender_name,
-                            'group_id': current_group_id,
-                            'timestamp': time.time()
-                        }
-                        # 广播文件列表更新
-                        self.broadcast_file_list_update(current_group_id)
-                        # 刷新服务器端文件列表
-                        self.refresh_file_list()
-                    except Exception as e:
-                        print(f"保存文件失败: {e}")
-                # 服务器日志只显示文件名和大小信息
-                file_size = len(base64.b64decode(file_data)) if file_data else 0
-                self.messages.configure(state='normal')
-                self.messages.insert(tk.END, f"[{group['name']}文件] {sender_name}: {file_name} ({file_size} bytes)\n")
-                self.messages.configure(state='disabled')
-                self.messages.yview(tk.END)
+            if group_id in self.groups:
+                group_name = self.groups[group_id]['name']
+                # 获取文件存储路径
+                folder_path, json_file, files_folder = self.get_chat_storage_path(group_id, group_name, "group")
+                
+                # 生成文件名：名字+发送时间戳
+                file_base = os.path.splitext(file_name)[0]
+                file_ext = os.path.splitext(file_name)[1]
+                timestamp = int(time.time())
+                saved_filename = f"{file_base}_{timestamp}{file_ext}"
+                file_path = os.path.join(files_folder, saved_filename)
+                
+                try:
+                    file_bytes = base64.b64decode(file_data)
+                    with open(file_path, 'wb') as f:
+                        f.write(file_bytes)
+                    
+                    file_id = f"{group_id}_{timestamp}_{file_name}"
+                    self.stored_files[file_id] = {
+                        'filename': file_name,
+                        'saved_filename': saved_filename,
+                        'path': file_path,
+                        'sender': sender_name,
+                        'group_id': group_id,
+                        'timestamp': timestamp
+                    }
+                    # 广播文件列表更新
+                    self.broadcast_file_list_update(group_id)
+                    # 刷新服务器端文件列表
+                    self.refresh_file_list()
+                except Exception as e:
+                    print(f"保存文件失败: {e}")
     
     def handle_image_transfer(self, sender_client, json_msg):
         """处理图片传输"""
@@ -2418,7 +2559,778 @@ class ChatServer:
             self.sock.close()
         os._exit(0)
 
+
+class ChatClient:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("聊天客户端 Chat Client")
+        # 透明度设置
+        self.window_alpha = 1.0  # 默认100%不透明
+        self.language = "zh"  # "zh" 或 "en"
+        self.theme = "light"  # "light" 或 "dark"
+        self.translations = self.load_translations()
+        # ==== 本地缓存相关 ====
+        self.local_storage_path = os.path.join(os.getcwd(), "local_cache")
+        if not os.path.exists(self.local_storage_path):
+            os.makedirs(self.local_storage_path)
+        self.offline_mode = False
+        self.pending_messages = []
+        # ==== 本地缓存end ====
+        self.setup_widgets()
+        self.sock = None
+        self.muted = False
+        self.window_flashing = False
+        self.flash_count = 0
+        self.max_flash_count = 10
+        self.chat_mode = "group"
+        self.private_target = None
+        self.username = ""
+        self.current_group_id = "main"
+        self.current_group_name = "主群 Main Group"
+        self.my_groups = {}
+        self.is_group_owner = False
+        self.is_group_admin = False
+        self.is_server_owner = False
+        self.file_list = []
+        # 全局热键监控
+        self.hotkey_listener = None
+        self.hotkey_enabled = False
+        self.left_mouse_pressed = False
+        self.right_mouse_pressed = False
+        self.middle_mouse_pressed = False
+        self.keys_pressed = set()
+        self.last_hotkey_check = 0
+        self.was_kill_triggered = True  # 初始与C++逻辑一致
+
+    def setup_widgets(self):
+        if IS_WINDOWS:
+            font_family = "Microsoft YaHei UI"
+        elif IS_MACOS:
+            font_family = "PingFang SC"
+        else:
+            font_family = "DejaVu Sans"
+        font = tkFont.Font(family=font_family, size=10)
+        title_font = tkFont.Font(family=font_family, size=11, weight='bold')
+        
+        # 配置ttk样式
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('Action.TButton', font=font, padding=6)
+        style.configure('Title.TLabel', font=title_font)
+        
+        self.master.geometry("1200x700")
+        self.master.minsize(1000, 600)
+        
+        # 消息显示区域 - 使用ttk LabelFrame
+        msg_frame = ttk.LabelFrame(self.master, text="聊天消息 Chat Messages", padding=10)
+        msg_frame.grid(row=0, column=0, columnspan=3, sticky="nsew", padx=5, pady=5)
+        
+        msg_scroll_frame = tk.Frame(msg_frame)
+        msg_scroll_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.messages = tk.Text(msg_scroll_frame, state='disabled', font=font, wrap=tk.WORD,
+                               bg='#ffffff', fg='#333333', relief=tk.SUNKEN, borderwidth=1,
+                               selectbackground='#4A90E2', selectforeground='white')
+        self.messages.tag_config("link", foreground="#0066cc", underline=True)
+        self.messages.tag_bind("link", "<Button-1>", self.open_link)
+        self.messages.tag_bind("link", "<Enter>", lambda e: self.messages.config(cursor="hand2"))
+        self.messages.tag_bind("link", "<Leave>", lambda e: self.messages.config(cursor=""))
+        self.image_references = []
+        
+        scrollbar_msg = ttk.Scrollbar(msg_scroll_frame, orient=tk.VERTICAL, command=self.messages.yview)
+        self.messages.config(yscrollcommand=scrollbar_msg.set)
+        self.messages.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar_msg.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 群组列表 - 使用ttk LabelFrame
+        group_frame = ttk.LabelFrame(self.master, text="群组列表 Groups", padding=10)
+        group_frame.grid(row=0, column=3, sticky="nsew", padx=5, pady=5)
+        
+        group_scroll_frame = tk.Frame(group_frame)
+        group_scroll_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.group_listbox = tk.Listbox(group_scroll_frame, font=font, height=5,
+                                        bg='#ffffff', fg='#333333', relief=tk.SUNKEN, borderwidth=1,
+                                        selectbackground='#4A90E2', selectforeground='white')
+        self.group_listbox.grid(row=0, column=0, sticky="nsew")
+        self.group_listbox.bind("<Double-Button-1>", self.switch_group_from_list)
+        self.group_listbox.bind("<Button-3>", self.show_group_context_menu)  # 右键菜单
+        
+        group_scrollbar = ttk.Scrollbar(group_scroll_frame, orient=tk.VERTICAL, command=self.group_listbox.yview)
+        self.group_listbox.config(yscrollcommand=group_scrollbar.set)
+        group_scrollbar.grid(row=0, column=1, sticky="ns")
+        group_scroll_frame.grid_columnconfigure(0, weight=1)
+
+        # 用户列表 - 使用ttk LabelFrame
+        user_frame = ttk.LabelFrame(self.master, text="在线用户 Online Users", padding=10)
+        user_frame.grid(row=1, column=3, rowspan=3, sticky="nsew", padx=5, pady=5)
+        
+        user_scroll_frame = tk.Frame(user_frame)
+        user_scroll_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.client_listbox = tk.Listbox(user_scroll_frame, font=font,
+                                        bg='#ffffff', fg='#333333', relief=tk.SUNKEN, borderwidth=1,
+                                        selectbackground='#4A90E2', selectforeground='white')
+        self.client_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.client_listbox.bind("<Double-Button-1>", self.start_private_chat)
+        
+        user_scrollbar = ttk.Scrollbar(user_scroll_frame, orient=tk.VERTICAL, command=self.client_listbox.yview)
+        self.client_listbox.config(yscrollcommand=user_scrollbar.set)
+        user_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # 模式和控制按钮框架
+        mode_frame = ttk.Frame(self.master)
+        mode_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        
+        self.mode_label = ttk.Label(mode_frame, text="当前: 主群", font=font, style='Title.TLabel')
+        self.mode_label.pack(side=tk.LEFT, padx=5)
+        
+        self.mode_button = ttk.Button(mode_frame, text="切换私聊", command=self.toggle_chat_mode, style='Action.TButton')
+        self.mode_button.pack(side=tk.LEFT, padx=2)
+        
+        self.create_group_button = ttk.Button(mode_frame, text="创建小群", command=self.create_group_dialog, style='Action.TButton')
+        self.create_group_button.pack(side=tk.LEFT, padx=2)
+        
+        self.join_group_button = ttk.Button(mode_frame, text="加入群", command=self.join_group_dialog, style='Action.TButton')
+        self.join_group_button.pack(side=tk.LEFT, padx=2)
+        
+        self.invite_button = ttk.Button(mode_frame, text="拉人", command=self.invite_user_dialog, style='Action.TButton')
+        self.invite_button.pack(side=tk.LEFT, padx=2)
+        
+        # 管理按钮框架
+        self.manage_frame = ttk.Frame(self.master)
+        self.manage_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        
+        self.kick_member_button = ttk.Button(self.manage_frame, text="踢出成员", command=self.kick_member_dialog, 
+                                           style='Action.TButton', state='disabled')
+        self.kick_member_button.pack(side=tk.LEFT, padx=2)
+        
+        self.mute_member_button = ttk.Button(self.manage_frame, text="禁言成员", command=self.mute_member_dialog, 
+                                           style='Action.TButton', state='disabled')
+        self.mute_member_button.pack(side=tk.LEFT, padx=2)
+        
+        self.unmute_member_button = ttk.Button(self.manage_frame, text="解禁成员", command=self.unmute_member_dialog, 
+                                             style='Action.TButton', state='disabled')
+        self.unmute_member_button.pack(side=tk.LEFT, padx=2)
+        
+        self.set_admin_button = ttk.Button(self.manage_frame, text="设置管理员", command=self.set_admin_dialog, 
+                                         style='Action.TButton', state='disabled')
+        self.set_admin_button.pack(side=tk.LEFT, padx=2)
+        
+        self.remove_admin_button = ttk.Button(self.manage_frame, text="移除管理员", command=self.remove_admin_dialog, 
+                                            style='Action.TButton', state='disabled')
+        self.remove_admin_button.pack(side=tk.LEFT, padx=2)
+        
+        # 设置框架
+        settings_frame = ttk.Frame(self.master)
+        settings_frame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        
+        self.language_button = ttk.Button(settings_frame, text="中文/EN", command=self.toggle_language, style='Action.TButton')
+        self.language_button.pack(side=tk.LEFT, padx=2)
+        
+        self.theme_button = ttk.Button(settings_frame, text="主题 Theme", command=self.toggle_theme, style='Action.TButton')
+        self.theme_button.pack(side=tk.LEFT, padx=2)
+        
+        alpha_label = ttk.Label(settings_frame, text="透明度:", font=font)
+        alpha_label.pack(side=tk.LEFT, padx=2)
+        self.alpha_var = tk.StringVar(value="100%")
+        self.alpha_menu = ttk.OptionMenu(settings_frame, self.alpha_var, "100%",
+                                         *[f"{i}%" for i in range(10, 101, 10)],
+                                         command=self.on_alpha_change)
+        self.alpha_menu.pack(side=tk.LEFT, padx=2)
+
+        self.hotkey_button = ttk.Button(settings_frame, text="热键", command=self.toggle_hotkeys, style='Action.TButton')
+        self.hotkey_button.pack(side=tk.LEFT, padx=2)
+        
+        self.leave_group_button = ttk.Button(settings_frame, text="退出群聊", command=self.leave_group_dialog, style='Action.TButton')
+        self.leave_group_button.pack(side=tk.LEFT, padx=2)
+        
+        # 文件列表 - 使用ttk LabelFrame
+        file_frame = ttk.LabelFrame(self.master, text="文件列表 Files", padding=10)
+        file_frame.grid(row=0, column=4, rowspan=4, sticky="nsew", padx=5, pady=5)
+        
+        file_scroll_frame = tk.Frame(file_frame)
+        file_scroll_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.file_listbox = tk.Listbox(file_scroll_frame, font=font, height=15,
+                                      bg='#ffffff', fg='#333333', relief=tk.SUNKEN, borderwidth=1,
+                                      selectbackground='#4A90E2', selectforeground='white')
+        self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.file_listbox.bind("<Double-Button-1>", self.download_file_from_list)
+        
+        file_scrollbar = ttk.Scrollbar(file_scroll_frame, orient=tk.VERTICAL, command=self.file_listbox.yview)
+        self.file_listbox.config(yscrollcommand=file_scrollbar.set)
+        file_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 输入框和按钮
+        input_frame = ttk.Frame(self.master)
+        input_frame.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        
+        self.input_user = ttk.Entry(input_frame, font=font)
+        self.input_user.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        
+        button_frame = ttk.Frame(self.master)
+        button_frame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        
+        self.send_button = ttk.Button(button_frame, text="发送", command=self.send_message, style='Action.TButton')
+        self.send_button.pack(side=tk.LEFT, padx=2)
+        
+        self.file_button = ttk.Button(button_frame, text="文件", command=self.send_file, style='Action.TButton')
+        self.file_button.pack(side=tk.LEFT, padx=2)
+        
+        self.emoji_button = ttk.Button(button_frame, text="表情", command=self.show_emoji_picker, style='Action.TButton')
+        self.emoji_button.pack(side=tk.LEFT, padx=2)
+        
+        self.master.grid_columnconfigure(0, weight=2)
+        self.master.grid_columnconfigure(1, weight=1)
+        self.master.grid_columnconfigure(2, weight=1)
+        self.master.grid_columnconfigure(3, weight=1)
+        self.master.grid_columnconfigure(4, weight=1)
+        self.master.grid_rowconfigure(0, weight=3)
+        self.master.grid_rowconfigure(1, weight=0)
+        self.master.grid_rowconfigure(2, weight=0)
+        self.master.grid_rowconfigure(3, weight=0)
+        self.master.grid_rowconfigure(4, weight=0)
+        self.master.grid_rowconfigure(5, weight=0)
+        
+        self.master.bind("<Return>", self.send_message)
+        self.master.bind("<Map>", self.on_window_focus)
+        self.master.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.apply_theme()
+        self.set_window_alpha(self.window_alpha)
+
+    def show_group_context_menu(self, event):
+        """显示群组上下文菜单"""
+        index = self.group_listbox.nearest(event.y)
+        if index < 0:
+            return
+
+        group_info = self.group_listbox.get(index)
+        parts = group_info.split('|')
+        if len(parts) < 2:
+            return
+        group_id = parts[0]
+        group_name = parts[1]
+
+        context_menu = tk.Menu(self.master, tearoff=0)
+        if (self.is_group_owner or self.is_group_admin or self.is_server_owner) and group_id != "main":
+            context_menu.add_command(label="管理群组", 
+                                    command=lambda: self.manage_group(group_id, group_name))
+
+        context_menu.add_command(label="查看群信息", 
+                                command=lambda: self.view_group_info(group_id))
+
+        try:
+            context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            context_menu.grab_release()
+
+    def manage_group(self, group_id, group_name):
+        """管理群组"""
+        self.sock.sendall(f"/checkpermission {group_id}".encode('utf-8'))
+        manage_msg = f"/managegroup {group_id}"
+        self.sock.sendall(manage_msg.encode('utf-8'))
+
+    def connect(self, host, port, user):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.sock.connect((host, port))
+            self.username = user
+            threading.Thread(target=self.receive_message, args=(user,), daemon=True).start()
+        except socket.error as e:
+            error_msg = f"无法连接到服务器: {e}" if self.language == "zh" else f"Can't connect to server: {e}"
+            error_title = "连接错误" if self.language == "zh" else "Connection Error"
+            messagebox.showerror(error_title, error_msg)
+            self.master.destroy()
+        else:
+            success_msg = f"已连接到服务器 {host}:{port}" if self.language == "zh" else f"Connected to server {host}:{port}"
+            success_title = "连接成功" if self.language == "zh" else "Connection Successful"
+            messagebox.showinfo(success_title, success_msg)
+            self.sock.sendall(f"/name {user}".encode('utf-8'))
+            join_msg = f"用户 {user} 加入了聊天室。" if self.language == "zh" else f"User {user} has joined the chat room."
+            self.sock.sendall(join_msg.encode('utf-8'))
+            main_group_name = "主群" if self.language == "zh" else "Main Group"
+            self.my_groups = {"main": main_group_name}
+            self.current_group_id = "main"
+            self.current_group_name = main_group_name
+            self.update_group_list()
+            self.sock.sendall("/listgroups".encode('utf-8'))
+            self.sock.sendall(f"/checkpermission {self.current_group_id}".encode('utf-8'))
+            self.sock.sendall(f"/requestfilelist {self.current_group_id}".encode('utf-8'))
+
+    # ==== 本地缓存相关 ====
+    def save_message_to_local(self, chat_key, chat_name, sender, message, msg_type="group"):
+        """保存消息到本地缓存"""
+        timestamp = time.time()
+        msg_data = {
+            'sender': sender,
+            'message': message,
+            'timestamp': timestamp,
+            'datetime': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
+        }
+        # 本地缓存文件路径
+        safe_name = "".join(c for c in chat_name if c.isalnum() or c in ('_', '-', ' '))
+        safe_name = safe_name.replace(' ', '_')
+        cache_file = os.path.join(self.local_storage_path, f"{safe_name}.json")
+
+        # 读取或创建缓存文件
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except:
+                data = {
+                    'chat_name': chat_name,
+                    'chat_key': chat_key,
+                    'type': msg_type,
+                    'messages': []
+                }
+        else:
+            data = {
+                'chat_name': chat_name,
+                'chat_key': chat_key,
+                'type': msg_type,
+                'messages': []
+            }
+        data['messages'].append(msg_data)
+        # 保存到本地
+        try:
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"保存消息到本地缓存失败: {e}")
+
+    def load_local_messages(self, chat_key, chat_name):
+        """从本地缓存加载消息"""
+        safe_name = "".join(c for c in chat_name if c.isalnum() or c in ('_', '-', ' '))
+        safe_name = safe_name.replace(' ', '_')
+        cache_file = os.path.join(self.local_storage_path, f"{safe_name}.json")
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return data.get('messages', [])
+            except:
+                pass
+        return []
+    # ==== 本地缓存end ====
+
+    def receive_message(self, username):
+        buffer = b''
+        self.offline_mode = False  # 连接成功，退出离线模式
+
+        # 发送待处理消息
+        for msg in self.pending_messages[:]:
+            try:
+                self.sock.sendall(msg.encode('utf-8'))
+                self.pending_messages.remove(msg)
+            except:
+                continue
+
+        while True:
+            try:
+                data = self.sock.recv(8192)
+                if not data:
+                    # 连接断开，进入离线模式
+                    self.offline_mode = True
+                    self.messages.configure(state='normal')
+                    self.messages.insert(tk.END, "\n[系统] 连接断开，进入离线模式。重新连接后将同步消息。\n")
+                    self.messages.configure(state='disabled')
+                    self.messages.yview(tk.END)
+                    break
+                buffer += data
+
+                if buffer.startswith(b'{'):
+                    try:
+                        message_str = buffer.decode('utf-8')
+                        brace_count = 0
+                        end_idx = -1
+                        for i in range(len(message_str) - 1, -1, -1):
+                            if message_str[i] == '}':
+                                brace_count += 1
+                                if brace_count == 1:
+                                    end_idx = i
+                                    break
+                            elif message_str[i] == '{':
+                                brace_count -= 1
+                                if brace_count < 0:
+                                    break
+                        if end_idx != -1:
+                            try:
+                                json_msg = json.loads(message_str[:end_idx+1])
+                                buffer = buffer[end_idx+1:].lstrip()
+                                self.handle_file_receive(json_msg)
+                                continue
+                            except json.JSONDecodeError:
+                                if len(buffer) > 10 * 1024 * 1024:
+                                    buffer = b''
+                                    continue
+                                continue
+                    except UnicodeDecodeError:
+                        if len(buffer) > 10 * 1024 * 1024:
+                            buffer = b''
+                            continue
+                        continue
+
+                try:
+                    # 修正：避免group列表有permissioninfo等多余内容，引入只取首个 \n 行
+                    if b'\n' in buffer:
+                        parts = buffer.split(b'\n', 1)
+                        message = parts[0].decode('utf-8')
+                        buffer = parts[1] if len(parts) > 1 else b''
+                    else:
+                        if len(buffer) > 8192:
+                            continue
+                        message = buffer.decode('utf-8')
+                        buffer = b''
+                except UnicodeDecodeError:
+                    continue
+
+                if message.startswith("/name "):
+                    self.update_client_list(message.split()[1:])
+                    self.messages.configure(state='normal')
+                    self.messages.insert(tk.END, '正在刷新成员列表。Refreshing user list.\n')
+                    self.messages.configure(state='disabled')
+                    self.messages.yview(tk.END)
+                elif message.startswith("/groupcreated "):
+                    parts = message.split(' ', 3)
+                    if len(parts) >= 4:
+                        group_id = parts[1]
+                        group_name = parts[2]
+                        invite_code = parts[3]
+                        self.my_groups[group_id] = group_name
+                        self.current_group_id = group_id
+                        self.current_group_name = group_name
+                        self.update_group_list()
+                        self.mode_label.config(text=f"当前: {group_name}")
+                        messagebox.showinfo("成功", f"群组创建成功！\n群组名称: {group_name}\n邀请码: {invite_code}\n\nGroup created successfully!\nGroup name: {group_name}\nInvite code: {invite_code}")
+                elif message.startswith("/joinedgroup "):
+                    parts = message.split(' ', 2)
+                    if len(parts) >= 3:
+                        group_id = parts[1]
+                        group_name = parts[2]
+                        self.my_groups[group_id] = group_name
+                        self.current_group_id = group_id
+                        self.current_group_name = group_name
+                        self.update_group_list()
+                        self.mode_label.config(text=f"当前: {group_name}")
+                        messagebox.showinfo("成功", f"已加入群组 {group_name}。Joined group {group_name}.")
+                elif message.startswith("/switchedgroup "):
+                    parts = message.split(' ', 2)
+                    if len(parts) >= 3:
+                        group_id = parts[1]
+                        group_name = parts[2]
+                        self.current_group_id = group_id
+                        self.current_group_name = group_name
+                        self.mode_label.config(text=f"当前: {group_name}")
+                        self.messages.configure(state='normal')
+                        self.messages.delete(1.0, tk.END)
+                        self.messages.configure(state='disabled')
+                        self.sock.sendall(f"/requesthistory {group_id}".encode('utf-8'))
+                        self.sock.sendall(f"/checkpermission {group_id}".encode('utf-8'))
+                        self.sock.sendall(f"/requestfilelist {group_id}".encode('utf-8'))
+                elif message.startswith("/groupslist "):
+                    groups_str = message[12:].strip()
+                    valid_groups = []
+                    if groups_str:
+                        candidates = groups_str.strip().split()
+                        for group_info in candidates:
+                            if "|" in group_info and not group_info.lower().startswith("permissioninfo"):
+                                valid_groups.append(group_info)
+                        self.my_groups = {}
+                        for group_info in valid_groups:
+                            parts = group_info.split('|')
+                            if len(parts) >= 2:
+                                group_id = parts[0]
+                                group_name = parts[1]
+                                is_current = False
+                                if len(parts) >= 3 and parts[2] == 'True':
+                                    is_current = True
+                                self.my_groups[group_id] = group_name
+                                if is_current:
+                                    self.current_group_id = group_id
+                                    self.current_group_name = group_name
+                        if not self.my_groups:
+                            self.my_groups = {"main": "主群 Main Group"}
+                            self.current_group_id = "main"
+                            self.current_group_name = "主群 Main Group"
+                        else:
+                            if self.current_group_id not in self.my_groups:
+                                for gid, gname in self.my_groups.items():
+                                    self.current_group_id = gid
+                                    self.current_group_name = gname
+                                    break
+                        self.update_group_list()
+                        self.mode_label.config(text=f"当前: {self.current_group_name}")
+                        self.sock.sendall(f"/checkpermission {self.current_group_id}".encode('utf-8'))
+                        self.sock.sendall(f"/requestfilelist {self.current_group_id}".encode('utf-8'))
+                    else:
+                        self.my_groups = {"main": "主群 Main Group"}
+                        self.current_group_id = "main"
+                        self.current_group_name = "主群 Main Group"
+                        self.update_group_list()
+                        self.mode_label.config(text="当前: 主群")
+                        self.update_permission_buttons()
+                elif message.startswith("/permissioninfo "):
+                    parts = message.split()
+                    if len(parts) >= 4:
+                        self.is_group_owner = parts[1] == 'True'
+                        self.is_group_admin = parts[2] == 'True'
+                        self.is_server_owner = parts[3] == 'True'
+                        self.update_permission_buttons()
+                elif message.startswith("你已被设置为服主"):
+                    self.is_server_owner = True
+                    self.update_permission_buttons()
+                    messagebox.showinfo("提示", "你已被设置为服主。You have been set as server owner.")
+                elif message.startswith("/filelist "):
+                    parts = message.split(' ', 2)
+                    if len(parts) >= 3:
+                        group_id = parts[1]
+                        files_str = parts[2]
+                        if files_str and group_id == self.current_group_id:
+                            files_list = files_str.split()
+                            for file_info in files_list:
+                                file_parts = file_info.split('|')
+                                if len(file_parts) >= 2:
+                                    filename = file_parts[0]
+                                    sender = file_parts[1]
+                                    timestamp = float(file_parts[2]) if len(file_parts) >= 3 else time.time()
+                                    found = False
+                                    for f in self.file_list:
+                                        if f[0] == filename and f[2] == sender and f[3] == group_id:
+                                            found = True
+                                            break
+                                    if not found:
+                                        self.file_list.append((filename, timestamp, sender, group_id))
+                            self.file_list.sort(key=lambda x: x[1], reverse=True)
+                            self.refresh_file_list()
+                elif message.startswith("/leftgroup "):
+                    group_id = message[11:].strip()
+                    if group_id in self.my_groups:
+                        del self.my_groups[group_id]
+                        if self.current_group_id == group_id:
+                            self.current_group_id = "main"
+                            self.current_group_name = "主群 Main Group"
+                            self.mode_label.config(text="当前: 主群")
+                        self.update_group_list()
+                        msg = "已退出群组。Left group." if self.language == "zh" else "Left group."
+                        messagebox.showinfo("提示" if self.language == "zh" else "Info", msg)
+                elif message == f"{username} 已被踢出聊天室。{username} ,you have been kicked out of the chat room.":
+                    messagebox.showinfo("提示 Prompt", "你已被踢出聊天室。You have been kicked out of the chat room.")
+                    os._exit(0)
+                    break
+                elif message == f"用户 {username} 被禁言。{username} ,you have been banned.":
+                    self.muted = True
+                    messagebox.showinfo("提示", "你已被禁言。You have been banned.")
+                elif message == f"用户 {username} 被解除禁言。{username} ,you have been unbanned.":
+                    self.muted = False
+                    messagebox.showinfo("提示", "你已被解除禁言。You have been unbanned.")
+                elif message == f"/quit":
+                    messagebox.showinfo("提示", "服务器已关闭。The server has been closed.")
+                    os._exit(0)
+                    break
+                else:
+                    # ==== 本地缓存: 保存消息 ====
+                    if self.current_group_id:
+                        sender_name = "其他用户"
+                        raw = message
+                        if ": " in raw:
+                            sender_name = raw.split(": ", 1)[0]
+                        self.save_message_to_local(
+                            self.current_group_id, 
+                            self.current_group_name, 
+                            sender_name, 
+                            message, 
+                            "group"
+                        )
+                    # ==== 本地缓存end ====
+
+                    self.messages.configure(state='normal')
+                    self.insert_message_with_links(message)
+                    self.messages.configure(state='disabled')
+                    self.messages.yview(tk.END)
+                    if not self.master.focus_get():
+                        self.flash_window()
+            except socket.error as e:
+                print(f"接收错误 Receive error: {e}")
+                self.offline_mode = True
+                break
+
+    def send_message(self, event=None):
+        message = self.input_user.get()
+        if not message:
+            return
+        
+        if self.offline_mode:
+            self.pending_messages.append(message)
+            self.messages.configure(state='normal')
+            self.messages.insert(tk.END, f"[离线] {self.username}: {message}\n")
+            self.messages.configure(state='disabled')
+            self.messages.yview(tk.END)
+            if self.current_group_id:
+                self.save_message_to_local(
+                    self.current_group_id,
+                    self.current_group_name,
+                    self.username,
+                    message,
+                    "group"
+                )
+        else:
+            if self.chat_mode == "private" and self.private_target:
+                private_msg = f"/private {self.private_target} {message}"
+                self.sock.sendall(private_msg.encode('utf-8'))
+            else:
+                group_msg = f"/groupmsg {message}"
+                self.sock.sendall(group_msg.encode('utf-8'))
+
+        self.input_user.delete(0, tk.END)
+
+    def on_alpha_change(self, value):
+        alpha = int(value.replace('%', '')) / 100.0
+        self.set_window_alpha(alpha)
+        self.apply_theme()
+    
+    def set_window_alpha(self, alpha):
+        if not IS_WINDOWS:
+            try:
+                self.master.attributes('-alpha', alpha)
+                self.window_alpha = alpha
+            except:
+                if IS_MACOS:
+                    messagebox.showinfo("提示", "macOS系统上窗口透明度功能可能不可用。")
+                self.window_alpha = 1.0
+        else:
+            try:
+                self.master.attributes('-alpha', alpha)
+                self.window_alpha = alpha
+            except:
+                messagebox.showerror("错误", "您的系统不支持窗口透明度设置。")
+
+
 if __name__ == '__main__':
+    import argparse
+    
+    # 解析命令行参数（用于非交互式启动）
+    parser = argparse.ArgumentParser(description='聊天服务器')
+    parser.add_argument('--port', type=int, default=None, help='服务器端口号 (默认: 8888)')
+    parser.add_argument('--mode', type=str, choices=['server', 'client'], default=None, 
+                       help='运行模式: server(服务器) 或 client(客户端)')
+    args = parser.parse_args()
+    
+    # 创建启动选择窗口
     root = tk.Tk()
-    server = ChatServer(root)
-    root.mainloop()
+    root.withdraw()  # 先隐藏主窗口
+    
+    # 启动模式选择对话框
+    mode_window = tk.Toplevel(root)
+    mode_window.title("选择启动模式 Choose Mode")
+    mode_window.geometry("400x250")
+    mode_window.resizable(False, False)
+    mode_window.transient(root)
+    mode_window.grab_set()  # 模态对话框
+    
+    # 居中显示
+    mode_window.update_idletasks()
+    x = (mode_window.winfo_screenwidth() // 2) - (mode_window.winfo_width() // 2)
+    y = (mode_window.winfo_screenheight() // 2) - (mode_window.winfo_height() // 2)
+    mode_window.geometry(f"+{x}+{y}")
+    
+    # 配置样式
+    if IS_WINDOWS:
+        font_family = "Microsoft YaHei UI"
+    elif IS_MACOS:
+        font_family = "PingFang SC"
+    else:
+        font_family = "DejaVu Sans"
+    font = tkFont.Font(family=font_family, size=10)
+    title_font = tkFont.Font(family=font_family, size=12, weight='bold')
+    
+    # 标题
+    title_label = tk.Label(mode_window, text="请选择启动模式\nPlease Choose Mode", 
+                           font=title_font, pady=20)
+    title_label.pack()
+    
+    # 模式选择框架
+    mode_frame = tk.Frame(mode_window)
+    mode_frame.pack(pady=20)
+    
+    selected_mode = tk.StringVar(value=args.mode if args.mode else "server")
+    
+    server_radio = tk.Radiobutton(mode_frame, text="服务器模式 Server Mode", 
+                                  variable=selected_mode, value="server",
+                                  font=font, anchor="w", width=25)
+    server_radio.pack(pady=5, padx=20, anchor="w")
+    
+    client_radio = tk.Radiobutton(mode_frame, text="客户端模式 Client Mode", 
+                                  variable=selected_mode, value="client",
+                                  font=font, anchor="w", width=25)
+    client_radio.pack(pady=5, padx=20, anchor="w")
+    
+    # 端口输入（仅服务器模式需要）
+    port_frame = tk.Frame(mode_window)
+    port_frame.pack(pady=10)
+    
+    port_label = tk.Label(port_frame, text="端口号 Port:", font=font)
+    port_label.pack(side=tk.LEFT, padx=5)
+    
+    port_var = tk.StringVar(value=str(args.port if args.port else 8888))
+    port_entry = tk.Entry(port_frame, textvariable=port_var, font=font, width=10)
+    port_entry.pack(side=tk.LEFT, padx=5)
+    
+    # 按钮框架
+    button_frame = tk.Frame(mode_window)
+    button_frame.pack(pady=20)
+    
+    def start_application():
+        mode = selected_mode.get()
+        try:
+            port = int(port_var.get()) if port_var.get().strip() else 8888
+        except ValueError:
+            messagebox.showerror("错误 Error", "端口号必须是数字！\nPort must be a number!")
+            return
+        
+        mode_window.destroy()
+        root.deiconify()  # 显示主窗口
+        
+        if mode == 'server':
+            server = ChatServer(root, port=port)
+        else:
+            # 客户端模式
+            host = simpledialog.askstring("连接 Connect", "服务器地址 IP: ", initialvalue="127.0.0.1")
+            if not host:
+                root.destroy()
+                return
+            port_input = simpledialog.askinteger("连接 Connect", "端口号 Port: ", initialvalue=8888)
+            if port_input is None:
+                root.destroy()
+                return
+            user = ''
+            while not user or user.strip() == '':
+                user = simpledialog.askstring("连接 Connect", "用户名 Username: ")
+                if not user:
+                    root.destroy()
+                    return
+            client = ChatClient(root)
+            client.connect(host, port_input, user)
+        
+        root.mainloop()
+    
+    def cancel_application():
+        root.destroy()
+        mode_window.destroy()
+    
+    start_button = tk.Button(button_frame, text="确定 OK", command=start_application, 
+                            font=font, bg="#4CAF50", fg="white", width=10, padx=10, pady=5)
+    start_button.pack(side=tk.LEFT, padx=10)
+    
+    cancel_button = tk.Button(button_frame, text="取消 Cancel", command=cancel_application, 
+                             font=font, bg="#f44336", fg="white", width=10, padx=10, pady=5)
+    cancel_button.pack(side=tk.LEFT, padx=10)
+    
+    # 绑定回车键
+    mode_window.bind('<Return>', lambda e: start_application())
+    mode_window.bind('<Escape>', lambda e: cancel_application())
+    port_entry.focus_set()
+    
+    # 运行选择对话框
+    mode_window.mainloop()
