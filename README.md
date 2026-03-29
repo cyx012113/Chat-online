@@ -1,4 +1,4 @@
-![CC BY-NC-SA 4.0](https://licensebuttons.net/l/by-nc-sa/4.0/88x31.png)
+[![CC BY-NC-SA 4.0](https://licensebuttons.net/l/by-nc-sa/4.0/88x31.png)](https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode.txt)
 
 ### 建议 Advice
 各个版本功能、通信协议不同，为了保证功能完整性，请勿使用不同版本的应用进行通信。
