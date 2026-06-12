@@ -1,6 +1,10 @@
 # Chat-online Python 局域网聊天室
 
-[![CC BY-NC-SA 4.0](https://licensebuttons.net/l/by-nc-sa/4.0/88x31.png)](https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode.txt)
+[MIT License](https://mit-license.org/)
+
+从 `5.1.0 + MIT` 版本开始，源代码协议从 CC BY-SA 4.0 更换为了 MIT 协议
+
+Starting from version `5.1.0 + MIT`, the source code license has been changed from CC BY-SA 4.0 to the MIT license.
 
 ## 建议 Advice
 
