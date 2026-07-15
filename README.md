@@ -1,12 +1,14 @@
 # Chat Online
 
+[MIT License](https://mit-license.org/)
+
 基于 PyQt6 的局域网即时通信工具。一个程序同时提供聊天客户端、可视化服务器控制台和无界面服务器 CLI，适合家庭、教室、实验室与小型团队在可信局域网中快速建立聊天室。
 
 `6.0.0` · `Python 3.10+` · `PyQt6` · `MIT`
 
 <p align="center">
-  <img src="docs/images/client-light.png" alt="Chat Online 客户端亮色主题" width="49%">
-  <img src="docs/images/client-dark.png" alt="Chat Online 客户端暗色主题" width="49%">
+  <img src="docs/images/client-light.png" alt="Chat Online 客户端亮色主题" width="50%">
+  <img src="docs/images/client-dark.png" alt="Chat Online 客户端暗色主题" width="50%">
 </p>
 
 <details>
@@ -301,4 +303,4 @@ py -m pip install -r requirements.txt
 
 ## License
 
-本项目使用 [MIT License](LICENCE)。
+本项目使用 [MIT License](https://mit-license.org/)。
