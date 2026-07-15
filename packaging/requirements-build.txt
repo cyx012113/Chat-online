@@ -1,0 +1,5 @@
+PyInstaller>=6.19,<7
+build>=1.2,<2
+Pillow>=11,<13
+setuptools>=70
+wheel>=0.45

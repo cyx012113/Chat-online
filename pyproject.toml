@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chat-online-lan"
+version = "6.0.0"
+description = "Modern PyQt6 LAN chat client and server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENCE"]
+authors = [{name = "Chat Online contributors"}]
+dependencies = ["PyQt6>=6.7,<7"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+chat-online = "chat_online.app:main"
+
+[tool.setuptools.packages.find]
+include = ["chat_online*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
