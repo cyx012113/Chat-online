@@ -1,16 +1,41 @@
 """Smoke-test a packaged Windows release outside the source interpreter."""
 
+# ruff: noqa: E402 - direct script execution needs the project root first
+
 from __future__ import annotations
 
 import argparse
 import os
 from pathlib import Path
 from queue import Empty, Queue
+import re
 import signal
+import socket
+import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from chat_online.protocol import PacketReader, encode_packet
+from chat_online.secure_protocol import (
+    PROTOCOL_VERSION,
+    SECURITY_VERSION,
+    identity_fields,
+    message_envelope,
+)
+from chat_online.security import (
+    TLS_ALPN_PROTOCOL,
+    Identity,
+    decrypt_message_text,
+)
+from chat_online.server import MAIN_ROOM_ID
+from chat_online.version import __version__
 
 
 def run_checked(arguments: list[str], timeout: float = 20) -> str:
@@ -30,6 +55,76 @@ def run_checked(arguments: list[str], timeout: float = 20) -> str:
     return result.stdout + result.stderr
 
 
+def secure_roundtrip(port: int) -> None:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
+    context.maximum_version = ssl.TLSVersion.TLSv1_3
+    context.set_alpn_protocols([TLS_ALPN_PROTOCOL])
+    identity = Identity.generate()
+    raw_socket = socket.create_connection(("127.0.0.1", port), timeout=5)
+    with context.wrap_socket(raw_socket, server_hostname="127.0.0.1") as connection:
+        connection.settimeout(5)
+        if connection.version() != "TLSv1.3":
+            raise RuntimeError("Packaged server did not negotiate TLS 1.3")
+        if connection.selected_alpn_protocol() != TLS_ALPN_PROTOCOL:
+            raise RuntimeError("Packaged server did not negotiate Chat Online ALPN")
+        connection.sendall(
+            encode_packet(
+                {
+                    "type": "hello",
+                    "username": "ReleaseSmoke",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "security_version": SECURITY_VERSION,
+                    **identity_fields(identity),
+                }
+            )
+        )
+        reader = PacketReader()
+        hello: dict | None = None
+        while hello is None:
+            for packet in reader.feed(connection.recv(65536)):
+                if packet.get("type") == "hello_ok":
+                    hello = packet
+                    break
+        if hello.get("e2ee_required") is not True:
+            raise RuntimeError("Packaged server did not require E2EE")
+
+        envelope = message_envelope(
+            identity,
+            [identity.public_key],
+            "packaged secure smoke",
+            scope="room",
+            room_id=MAIN_ROOM_ID,
+        )
+        message_id = envelope["metadata"]["id"]
+        connection.sendall(
+            encode_packet(
+                {
+                    "type": "message",
+                    "room_id": MAIN_ROOM_ID,
+                    "envelope": envelope,
+                }
+            )
+        )
+        echoed: dict | None = None
+        while echoed is None:
+            for packet in reader.feed(connection.recv(65536)):
+                if packet.get("type") == "message" and packet.get("id") == message_id:
+                    echoed = packet
+                    break
+        if "text" in echoed:
+            raise RuntimeError("Packaged server exposed plaintext message content")
+        plaintext = decrypt_message_text(
+            echoed["envelope"],
+            identity.private_key,
+            identity.public_key,
+        )
+        if plaintext != "packaged secure smoke":
+            raise RuntimeError("Packaged E2EE message roundtrip failed")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("release_dir", type=Path)
@@ -41,7 +136,7 @@ def main() -> int:
         raise FileNotFoundError("Packaged GUI or CLI executable is missing")
 
     version_output = run_checked([str(cli), "--version"])
-    if "Chat Online 6.0.0" not in version_output:
+    if f"Chat Online {__version__}" not in version_output:
         raise RuntimeError(f"Unexpected version output: {version_output!r}")
     help_output = run_checked([str(cli), "--help"])
     if "--headless" not in help_output:
@@ -81,6 +176,7 @@ def main() -> int:
                 temporary,
             ],
             cwd=release_dir,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -92,6 +188,7 @@ def main() -> int:
             deadline = time.monotonic() + 15
             output_lines: list[str] = []
             output_queue: Queue[str] = Queue()
+            listening_port: int | None = None
 
             def read_output() -> None:
                 if headless_process.stdout is None:
@@ -107,15 +204,19 @@ def main() -> int:
                     line = ""
                 if line:
                     output_lines.append(line)
-                    if "Server listening on 127.0.0.1:" in line:
+                    match = re.search(r"Server listening on 127\.0\.0\.1:(\d+)", line)
+                    if match:
+                        listening_port = int(match.group(1))
                         break
                 elif headless_process.poll() is not None:
                     break
             else:
                 raise RuntimeError("Timed out waiting for packaged headless server")
-            if not any("Server listening on 127.0.0.1:" in line for line in output_lines):
+            if listening_port is None:
                 raise RuntimeError("Packaged headless server did not start: " + "".join(output_lines))
-            headless_process.send_signal(signal.CTRL_C_EVENT)
+            secure_roundtrip(listening_port)
+            shutdown_signal = getattr(signal, "CTRL_BREAK_EVENT", signal.SIGINT)
+            headless_process.send_signal(shutdown_signal)
             headless_process.wait(timeout=10)
             if headless_process.returncode != 0:
                 raise RuntimeError(f"Headless server exited with {headless_process.returncode}")
@@ -130,4 +231,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

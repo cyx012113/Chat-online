@@ -13,6 +13,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication
 
 from chat_online.client_window import ClientWindow
+from chat_online.secure_protocol import identity_fields
+from chat_online.security import Identity, encrypt_file
 from chat_online.server_window import ServerWindow
 from chat_online.storage import AppStorage
 from chat_online.theme import apply_theme
@@ -26,12 +28,34 @@ def render(output_dir: Path) -> list[Path]:
     rendered: list[Path] = []
 
     with tempfile.TemporaryDirectory() as temporary:
+        alice_identity = Identity.generate()
+        bob_identity = Identity.generate()
+        carol_identity = Identity.generate()
         storage = AppStorage(Path(temporary))
-        storage.save_file(
-            "preview-file",
-            "project-notes.txt",
+        encrypted_preview = encrypt_file(
             b"preview",
-            {"room_id": "main", "sender": "Alice", "uploaded_at": time.time()},
+            "project-notes.txt",
+            bob_identity.private_key,
+            [
+                alice_identity.public_key,
+                bob_identity.public_key,
+                carol_identity.public_key,
+            ],
+            authenticated_metadata={"room_id": "main", "timestamp": time.time()},
+        )
+        stored_preview = storage.save_file(
+            encrypted_preview.envelope["file_id"],
+            "encrypted-file",
+            encrypted_preview.ciphertext,
+            {
+                "room_id": "main",
+                "sender": "Bob",
+                "sender_id": "bob-session",
+                "uploaded_at": time.time(),
+                "plaintext_size": len(b"preview"),
+                "envelope": encrypted_preview.envelope,
+                **identity_fields(bob_identity, sender=True),
+            },
         )
 
         apply_theme(app, "light")
@@ -78,7 +102,14 @@ def render(output_dir: Path) -> list[Path]:
         rendered.append(server_path)
         server.close()
 
-        client = ClientWindow("192.168.1.10", 8888, "Alice", auto_connect=False)
+        client = ClientWindow(
+            "192.168.1.10",
+            8888,
+            "Alice",
+            auto_connect=False,
+            security_dir=Path(temporary) / "client-security",
+            identity=alice_identity,
+        )
         client.session_id = "alice-session"
         client.message_list.set_identity("alice-session")
         client._apply_snapshot(
@@ -90,12 +121,35 @@ def render(output_dir: Path) -> list[Path]:
                     {"id": "room-design", "name": "Design Team", "member_count": 2, "role": "owner", "muted": False, "invite_code": "N7D4K2P9"},
                 ],
                 "users": [
-                    {"id": "alice-session", "username": "Alice", "role": "member", "muted": False},
-                    {"id": "bob-session", "username": "Bob", "role": "admin", "muted": False},
-                    {"id": "carol-session", "username": "Carol", "role": "member", "muted": False},
+                    {
+                        "id": "alice-session",
+                        "username": "Alice",
+                        "role": "member",
+                        "muted": False,
+                        **identity_fields(alice_identity),
+                    },
+                    {
+                        "id": "bob-session",
+                        "username": "Bob",
+                        "role": "admin",
+                        "muted": False,
+                        **identity_fields(bob_identity),
+                    },
+                    {
+                        "id": "carol-session",
+                        "username": "Carol",
+                        "role": "member",
+                        "muted": False,
+                        **identity_fields(carol_identity),
+                    },
                 ],
                 "files": [
-                    {"id": "preview-file", "name": "project-notes.txt", "size": 2048, "sender": "Bob", "uploaded_at": time.time()},
+                    {
+                        **stored_preview,
+                        "id": encrypted_preview.envelope["file_id"],
+                        "name": "Encrypted file",
+                        "size": len(b"preview"),
+                    },
                 ],
             }
         )
@@ -103,8 +157,30 @@ def render(output_dir: Path) -> list[Path]:
         client.message_list.set_messages(
             [
                 {"type": "message", "sender": "System", "sender_id": "system", "text": "Welcome to Main Lounge", "kind": "system", "timestamp": now - 180},
-                {"type": "message", "sender": "Bob", "sender_id": "bob-session", "text": "The latest build is ready for review: https://example.com/review", "kind": "chat", "timestamp": now - 90},
-                {"type": "message", "sender": "Alice", "sender_id": "alice-session", "text": "Thanks, I will check it now.", "kind": "chat", "timestamp": now - 35},
+                {
+                    "type": "message",
+                    "sender": "Bob",
+                    "sender_id": "bob-session",
+                    "text": (
+                        "### Build ready\n\n"
+                        "- [x] TLS 1.3\n"
+                        "- [ ] UI review\n\n"
+                        "```python line-numbers lines=2-2\n"
+                        "status = 'secure'\n"
+                        "print(status)\n"
+                        "```"
+                    ),
+                    "kind": "chat",
+                    "timestamp": now - 90,
+                },
+                {
+                    "type": "message",
+                    "sender": "Alice",
+                    "sender_id": "alice-session",
+                    "text": "**收到**，查看 [测试报告](https://example.com/review)。",
+                    "kind": "chat",
+                    "timestamp": now - 35,
+                },
                 {"type": "file_shared", "sender": "Bob", "file": {"id": "preview-file", "name": "project-notes.txt", "size": 2048}, "timestamp": now - 10},
             ]
         )
@@ -133,4 +209,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

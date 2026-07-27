@@ -2,13 +2,30 @@
 
 from __future__ import annotations
 
+import hashlib
 import socket
+import ssl
 import threading
+from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from .protocol import PacketReader, ProtocolError, encode_packet
+from .secure_protocol import (
+    PROTOCOL_VERSION,
+    SECURITY_VERSION,
+    identity_fields,
+)
+from .security import (
+    TLS_ALPN_PROTOCOL,
+    CertificatePinStore,
+    Identity,
+    SecurityError,
+    create_tls_client_context,
+    default_client_security_dir,
+    verify_tls_peer,
+)
 
 
 class ClientSignals(QObject):
@@ -38,10 +55,25 @@ class ChatClientConnection(QObject):
         parent: QObject | None = None,
         *,
         connect_timeout: float = 8.0,
+        ssl_context: ssl.SSLContext | None = None,
+        pin_store: CertificatePinStore | None = None,
+        identity: Identity | None = None,
+        security_dir: str | Path | None = None,
     ) -> None:
         super().__init__(parent)
         self.signals = ClientSignals(self)
         self._connect_timeout = max(0.1, float(connect_timeout))
+        self._ssl_context = ssl_context or create_tls_client_context(tofu=True)
+        self._security_dir = (
+            Path(security_dir)
+            if security_dir is not None
+            else default_client_security_dir()
+        )
+        self._pin_store = pin_store or CertificatePinStore(
+            self._security_dir / "server-cert-pins.json"
+        )
+        self._identity = identity
+        self._identity_username = "" if identity is None else "*"
         self._lock = threading.RLock()
         self._send_lock = threading.Lock()
         self._generation = 0
@@ -53,6 +85,8 @@ class ChatClientConnection(QObject):
         self._host = ""
         self._port: int | None = None
         self._username = ""
+        self._tls_version = ""
+        self._tls_fingerprint = ""
 
     @property
     def is_connected(self) -> bool:
@@ -79,6 +113,41 @@ class ChatClientConnection(QObject):
         with self._lock:
             return self._state
 
+    @property
+    def tls_version(self) -> str:
+        with self._lock:
+            return self._tls_version
+
+    @property
+    def tls_fingerprint(self) -> str:
+        with self._lock:
+            return self._tls_fingerprint
+
+    @property
+    def identity(self) -> Identity | None:
+        with self._lock:
+            return self._identity
+
+    def ensure_identity(self, username: str) -> Identity:
+        """Load or create the persistent RSA identity for one username."""
+
+        normalized = " ".join(str(username).split())
+        if not normalized:
+            raise ValueError("Username is required.")
+        with self._lock:
+            if self._identity is not None and self._identity_username in {
+                "*",
+                normalized.casefold(),
+            }:
+                return self._identity
+        digest = hashlib.sha256(normalized.casefold().encode("utf-8")).hexdigest()
+        identity_path = self._security_dir / "identities" / f"{digest}.key"
+        identity = Identity.load_or_create(identity_path)
+        with self._lock:
+            self._identity = identity
+            self._identity_username = normalized.casefold()
+            return identity
+
     def connect_to(self, host: str, port: int, username: str) -> bool:
         """Start connecting in the background and return immediately."""
 
@@ -104,11 +173,19 @@ class ChatClientConnection(QObject):
             self._host = clean_host
             self._port = clean_port
             self._username = clean_username
+            self._tls_version = ""
+            self._tls_fingerprint = ""
             self._stop_event = stop_event
             self._state = "connecting"
             thread = threading.Thread(
                 target=self._connection_loop,
-                args=(generation, stop_event, clean_host, clean_port, clean_username),
+                args=(
+                    generation,
+                    stop_event,
+                    clean_host,
+                    clean_port,
+                    clean_username,
+                ),
                 name=f"chat-connection-{generation}",
                 daemon=True,
             )
@@ -211,20 +288,62 @@ class ChatClientConnection(QObject):
         reason = "Connection closed by the server."
         error_message: str | None = None
         try:
+            identity = self.ensure_identity(username)
+            if not self._is_current(generation, stop_event):
+                return
             sock = socket.create_connection(
                 (host, port), timeout=self._connect_timeout
             )
+            with self._lock:
+                if generation != self._generation or stop_event.is_set():
+                    return
+                self._socket = sock
+                self._state = "securing"
+                self.signals.state_changed.emit(
+                    "securing", "Establishing a secure TLS 1.3 connection..."
+                )
+
+            tls_socket = self._ssl_context.wrap_socket(
+                sock,
+                server_hostname=host,
+                do_handshake_on_connect=False,
+            )
+            sock = tls_socket
+            with self._lock:
+                if generation != self._generation or stop_event.is_set():
+                    return
+                self._socket = tls_socket
+            tls_socket.do_handshake()
+            if tls_socket.version() != "TLSv1.3":
+                raise SecurityError("the server did not negotiate TLS 1.3")
+            if tls_socket.selected_alpn_protocol() != TLS_ALPN_PROTOCOL:
+                raise SecurityError("the server did not negotiate the Chat Online protocol")
+            peer_id = self._tls_peer_id(host, port)
+            pin_result = verify_tls_peer(tls_socket, peer_id, self._pin_store)
             sock.settimeout(0.5)
             with self._lock:
                 if generation != self._generation or stop_event.is_set():
                     return
                 self._socket = sock
                 self._state = "handshaking"
-                self.signals.state_changed.emit(
-                    "handshaking", "Waiting for the server handshake..."
+                self._tls_version = tls_socket.version() or "TLSv1.3"
+                self._tls_fingerprint = pin_result.fingerprint
+                trust_message = (
+                    "Secure connection established; server certificate trusted for the first time."
+                    if pin_result.first_seen
+                    else "Secure connection established; waiting for the server handshake..."
                 )
+                self.signals.state_changed.emit("handshaking", trust_message)
 
-            hello = encode_packet({"type": "hello", "username": username})
+            hello = encode_packet(
+                {
+                    "type": "hello",
+                    "username": username,
+                    "protocol_version": PROTOCOL_VERSION,
+                    "security_version": SECURITY_VERSION,
+                    **identity_fields(identity),
+                }
+            )
             with self._send_lock:
                 if not self._is_current(generation, stop_event):
                     return
@@ -267,6 +386,9 @@ class ChatClientConnection(QObject):
         except ProtocolError as exc:
             reason = f"Protocol error: {exc}"
             error_message = reason
+        except SecurityError as exc:
+            reason = f"Security error: {self._exception_text(exc)}"
+            error_message = reason
         except OSError as exc:
             reason = f"Connection error: {self._exception_text(exc)}"
             error_message = reason
@@ -283,10 +405,13 @@ class ChatClientConnection(QObject):
         with self._lock:
             if generation != self._generation:
                 return
+            secured_packet = dict(packet)
+            secured_packet["tls_version"] = self._tls_version
+            secured_packet["tls_fingerprint"] = self._tls_fingerprint
             self._is_connected = True
             self._state = "connected"
             self.signals.state_changed.emit("connected", "Connected.")
-            self.signals.connected.emit(packet)
+            self.signals.connected.emit(secured_packet)
 
     def _emit_packet(self, generation: int, packet: dict[str, Any]) -> None:
         with self._lock:
@@ -352,6 +477,13 @@ class ChatClientConnection(QObject):
             sock.close()
         except OSError:
             pass
+
+    @staticmethod
+    def _tls_peer_id(host: str, port: int) -> str:
+        normalized = host.strip().casefold()
+        if ":" in normalized and not normalized.startswith("["):
+            normalized = f"[{normalized}]"
+        return f"{normalized}:{port}"
 
     @staticmethod
     def _exception_text(exc: BaseException) -> str:

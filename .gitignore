@@ -7,6 +7,7 @@ __pycache__/
 venv/
 build/
 dist/
+release/
 previews/
 chat_data/
 server_files/

@@ -1,0 +1,6 @@
+include CHANGELOG.md
+include requirements.txt
+include *.py
+recursive-include packaging *.md *.ps1 *.spec *.txt
+recursive-include tools *.py
+recursive-include docs/images *.png

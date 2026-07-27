@@ -284,7 +284,11 @@ def _execute_parsed(engine: Any, command: ParsedCommand) -> CommandResult:
         for metadata in files:
             if not isinstance(metadata, dict):
                 continue
-            filename = metadata.get("original_name", metadata.get("name", "file"))
+            filename = (
+                "[encrypted]"
+                if isinstance(metadata.get("envelope"), dict)
+                else "[legacy plaintext; relay disabled]"
+            )
             lines.append(
                 f"  {filename} [{metadata.get('file_id', '?')}] "
                 f"{_format_size(metadata.get('size'))} room={metadata.get('room_id', '?')}"
@@ -434,7 +438,8 @@ def _console_input_loop(bridge: _ConsoleBridge, runtime: _HeadlessRuntime) -> No
         try:
             line = input("chat-online> ")
         except EOFError:
-            bridge.shutdown_requested.emit("Console input closed; stopping server.")
+            # A packaged console can report itself as a TTY while stdin is
+            # already closed. Keep the server alive for signal-based shutdown.
             return
         except KeyboardInterrupt:
             bridge.shutdown_requested.emit("Console interrupted; stopping server.")
@@ -481,6 +486,8 @@ def run_headless_server(
         handled_signals = [signal.SIGINT]
         if hasattr(signal, "SIGTERM"):
             handled_signals.append(signal.SIGTERM)
+        if hasattr(signal, "SIGBREAK"):
+            handled_signals.append(signal.SIGBREAK)
 
         def request_shutdown(signum: int, _frame: Any) -> None:
             try:

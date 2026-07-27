@@ -7,10 +7,11 @@ emit signals, leaving every UI update on Qt's main thread.
 from __future__ import annotations
 
 import base64
-import binascii
+from collections import deque
 import ipaddress
 import secrets
 import socket
+import ssl
 import string
 import threading
 import time
@@ -18,9 +19,27 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from cryptography.hazmat.primitives.asymmetric import rsa
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from .protocol import MAX_FILE_BYTES, PacketReader, ProtocolError, encode_packet
+from .secure_protocol import (
+    MAX_ENCRYPTED_FILE_BYTES,
+    PROTOCOL_VERSION,
+    SECURITY_VERSION,
+    SecureProtocolError,
+    decode_file_ciphertext,
+    load_identity_fields,
+    require_exact_recipients,
+    validate_file_envelope,
+    validate_message_envelope,
+)
+from .security import (
+    TLS_ALPN_PROTOCOL,
+    SecurityError,
+    create_tls_server_context,
+    ensure_self_signed_certificate,
+)
 from .storage import AppStorage, StorageError
 
 
@@ -50,10 +69,18 @@ class ClientSession:
     current_room: str = MAIN_ROOM_ID
     send_lock: threading.Lock = field(default_factory=threading.Lock)
     closed: threading.Event = field(default_factory=threading.Event)
+    identity_key: rsa.RSAPublicKey | None = None
+    identity_key_pem: str = ""
+    identity_fingerprint: str = ""
 
     @property
     def ready(self) -> bool:
-        return bool(self.username) and not self.closed.is_set()
+        return (
+            bool(self.username)
+            and self.identity_key is not None
+            and bool(self.identity_fingerprint)
+            and not self.closed.is_set()
+        )
 
 
 @dataclass
@@ -71,12 +98,24 @@ class Room:
 class ChatServerEngine:
     """Owns server state and handles JSON-line protocol clients."""
 
-    def __init__(self, storage: AppStorage | None = None) -> None:
+    def __init__(
+        self,
+        storage: AppStorage | None = None,
+        *,
+        ssl_context: ssl.SSLContext | None = None,
+        tls_handshake_timeout: float = 8.0,
+    ) -> None:
         self.signals = ServerSignals()
         self.storage = storage or AppStorage()
         self._lock = threading.RLock()
         self._listener: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
+        self._ssl_context = ssl_context
+        self._tls_handshake_timeout = max(0.1, float(tls_handshake_timeout))
+        self._tls_certificate_fingerprint = ""
+        self._pending_sockets: set[socket.socket] = set()
+        self._seen_envelope_ids: set[str] = set()
+        self._seen_envelope_order: deque[str] = deque()
         self._stop_event = threading.Event()
         self._sessions: dict[str, ClientSession] = {}
         self._usernames: dict[str, str] = {}
@@ -108,6 +147,24 @@ class ChatServerEngine:
         if not 0 <= int(port) <= 65535:
             self.signals.error.emit("Port must be between 0 and 65535.")
             return False
+
+        if self._ssl_context is None:
+            security_dir = self.storage.root / "security"
+            certificate_path = security_dir / "tls-cert.pem"
+            private_key_path = security_dir / "tls-key.pem"
+            try:
+                certificate = ensure_self_signed_certificate(
+                    certificate_path,
+                    private_key_path,
+                )
+                self._ssl_context = create_tls_server_context(
+                    certificate.certificate_path,
+                    certificate.private_key_path,
+                )
+                self._tls_certificate_fingerprint = certificate.fingerprint
+            except (OSError, SecurityError, ssl.SSLError, ValueError) as exc:
+                self.signals.error.emit(f"Could not initialize TLS: {exc}")
+                return False
 
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -150,6 +207,10 @@ class ChatServerEngine:
 
         with self._lock:
             sessions = list(self._sessions.values())
+            pending_sockets = list(self._pending_sockets)
+            self._pending_sockets.clear()
+        for pending_socket in pending_sockets:
+            self._close_transport(pending_socket)
         for session in sessions:
             self._send(session, {"type": "server_shutdown", "message": "Server stopped."})
             self._close_socket(session)
@@ -324,6 +385,8 @@ class ChatServerEngine:
             "rooms": rooms,
             "banned": banned,
             "file_count": len(self.storage.list_files()),
+            "tls_version": "TLSv1.3",
+            "tls_fingerprint": self._tls_certificate_fingerprint,
         }
 
     def _accept_loop(self) -> None:
@@ -339,24 +402,65 @@ class ChatServerEngine:
                 break
 
             if self._is_banned(address[0]):
-                try:
-                    client_socket.sendall(
-                        encode_packet({"type": "error", "code": "banned", "message": "Address blocked."})
-                    )
-                except OSError:
-                    pass
-                client_socket.close()
+                self._close_transport(client_socket)
                 continue
 
-            client_socket.settimeout(0.5)
-            session = ClientSession(client_socket, address)
+            client_socket.settimeout(self._tls_handshake_timeout)
+            with self._lock:
+                if self._stop_event.is_set():
+                    self._close_transport(client_socket)
+                    break
+                self._pending_sockets.add(client_socket)
             thread = threading.Thread(
-                target=self._client_loop,
-                args=(session,),
-                name=f"chat-client-{session.id[:8]}",
+                target=self._secure_client_loop,
+                args=(client_socket, address),
+                name=f"chat-client-{address[0]}:{address[1]}",
                 daemon=True,
             )
             thread.start()
+
+    def _secure_client_loop(
+        self, client_socket: socket.socket, address: tuple[str, int]
+    ) -> None:
+        tls_socket: ssl.SSLSocket | None = None
+        session: ClientSession | None = None
+        try:
+            context = self._ssl_context
+            if context is None:
+                raise SecurityError("TLS server context is unavailable")
+            tls_socket = context.wrap_socket(
+                client_socket,
+                server_side=True,
+                do_handshake_on_connect=False,
+            )
+            with self._lock:
+                self._pending_sockets.discard(client_socket)
+                self._pending_sockets.add(tls_socket)
+            tls_socket.do_handshake()
+            if tls_socket.version() != "TLSv1.3":
+                raise SecurityError("client did not negotiate TLS 1.3")
+            if tls_socket.selected_alpn_protocol() != TLS_ALPN_PROTOCOL:
+                raise SecurityError("client did not negotiate the Chat Online protocol")
+            tls_socket.settimeout(0.5)
+            with self._lock:
+                self._pending_sockets.discard(tls_socket)
+            if self._stop_event.is_set():
+                return
+            session = ClientSession(tls_socket, address)
+            self._client_loop(session)
+        except (OSError, SecurityError, ssl.SSLError) as exc:
+            if not self._stop_event.is_set():
+                self._emit_log(
+                    "warning",
+                    f"TLS connection error from {address[0]}:{address[1]}: {exc}",
+                )
+        finally:
+            with self._lock:
+                self._pending_sockets.discard(client_socket)
+                if tls_socket is not None:
+                    self._pending_sockets.discard(tls_socket)
+            if session is None:
+                self._close_transport(tls_socket or client_socket)
 
     def _client_loop(self, session: ClientSession) -> None:
         reader = PacketReader()
@@ -422,12 +526,34 @@ class ChatServerEngine:
                 f"Username must contain 1-{MAX_USERNAME_CHARS} printable characters.",
             )
             return
+        if packet.get("protocol_version") != PROTOCOL_VERSION:
+            self._send_error(
+                session,
+                "incompatible_protocol",
+                f"Encrypted protocol version {PROTOCOL_VERSION} is required.",
+            )
+            return
+        if packet.get("security_version") != SECURITY_VERSION:
+            self._send_error(
+                session,
+                "incompatible_security",
+                f"Security protocol version {SECURITY_VERSION} is required.",
+            )
+            return
+        try:
+            identity_key, identity_fingerprint = load_identity_fields(packet)
+        except (SecurityError, SecureProtocolError, TypeError, ValueError) as exc:
+            self._send_error(session, "invalid_identity", str(exc))
+            return
         folded = username.casefold()
         with self._lock:
             if folded in self._usernames:
                 self._send_error(session, "duplicate_username", "That username is already online.")
                 return
             session.username = username
+            session.identity_key = identity_key
+            session.identity_key_pem = str(packet.get("identity_key", ""))
+            session.identity_fingerprint = identity_fingerprint
             self._sessions[session.id] = session
             self._usernames[folded] = session.id
             self._rooms[MAIN_ROOM_ID].members.add(session.id)
@@ -440,6 +566,9 @@ class ChatServerEngine:
                 "username": username,
                 "current_room": MAIN_ROOM_ID,
                 "max_file_bytes": MAX_FILE_BYTES,
+                "protocol_version": PROTOCOL_VERSION,
+                "security_version": SECURITY_VERSION,
+                "e2ee_required": True,
             },
         )
         self._send_history(session, MAIN_ROOM_ID)
@@ -458,51 +587,103 @@ class ChatServerEngine:
 
     def _handle_message(self, session: ClientSession, packet: dict[str, Any]) -> None:
         room_id = str(packet.get("room_id") or session.current_room)
-        text = self._clean_text(packet.get("text"))
-        if not text:
+        envelope = packet.get("envelope")
+        if not isinstance(envelope, dict) or session.identity_key is None:
+            self._send_error(session, "encryption_required", "A signed encrypted message is required.")
             return
         with self._lock:
             room = self._rooms.get(room_id)
             allowed = room is not None and session.id in room.members
             muted = bool(room and session.id in room.muted)
+            recipient_fingerprints = {
+                self._sessions[member_id].identity_fingerprint
+                for member_id in (room.members if room else set())
+                if member_id in self._sessions and self._sessions[member_id].ready
+            }
         if not allowed:
             self._send_error(session, "not_in_room", "You are not a member of that room.")
             return
         if muted:
             self._send_error(session, "muted", "You are muted in this room.")
             return
-        message = self._message_packet(room_id, session.username, session.id, text, "chat")
+        try:
+            metadata = validate_message_envelope(
+                envelope,
+                session.identity_key,
+                scope="room",
+                room_id=room_id,
+            )
+            require_exact_recipients(envelope, recipient_fingerprints)
+        except (SecurityError, SecureProtocolError, TypeError, ValueError) as exc:
+            self._send_error(session, "invalid_envelope", str(exc))
+            return
+        message_id = str(metadata["id"])
+        if not self._register_envelope_id(message_id):
+            self._send_error(session, "replayed_envelope", "This encrypted message was already received.")
+            return
+        message = self._encrypted_message_packet(
+            session,
+            envelope,
+            message_id=message_id,
+            scope="room",
+            room_id=room_id,
+            timestamp=float(metadata["timestamp"]),
+        )
         self.storage.append_message(room_id, message)
         self._broadcast_room(room_id, message)
-        self._emit_log("message", f"[{room.name}] {session.username}: {text}")
+        self._emit_log("message", f"[{room.name}] {session.username}: [encrypted message]")
 
     def _handle_private_message(self, session: ClientSession, packet: dict[str, Any]) -> None:
         target_name = str(packet.get("to", "")).strip()
-        text = self._clean_text(packet.get("text"))
-        if not target_name or not text:
+        envelope = packet.get("envelope")
+        if not target_name:
+            return
+        if not isinstance(envelope, dict) or session.identity_key is None:
+            self._send_error(session, "encryption_required", "A signed encrypted message is required.")
             return
         target = self._find_session_by_username(target_name)
         if target is None:
             self._send_error(session, "user_offline", f"{target_name} is not online.")
             return
+        if target.identity_key is None:
+            self._send_error(session, "invalid_identity", "The recipient has no valid identity key.")
+            return
+        try:
+            metadata = validate_message_envelope(
+                envelope,
+                session.identity_key,
+                scope="private",
+                target=target.username,
+            )
+            require_exact_recipients(
+                envelope,
+                {session.identity_fingerprint, target.identity_fingerprint},
+            )
+        except (SecurityError, SecureProtocolError, TypeError, ValueError) as exc:
+            self._send_error(session, "invalid_envelope", str(exc))
+            return
+        message_id = str(metadata["id"])
+        if not self._register_envelope_id(message_id):
+            self._send_error(session, "replayed_envelope", "This encrypted message was already received.")
+            return
         conversation_id = self._private_conversation_id(session.username, target.username)
-        message = {
-            "type": "message",
-            "id": uuid.uuid4().hex,
-            "scope": "private",
-            "conversation_id": conversation_id,
-            "sender": session.username,
-            "sender_id": session.id,
-            "to": target.username,
-            "text": text,
-            "kind": "chat",
-            "timestamp": time.time(),
-        }
+        message = self._encrypted_message_packet(
+            session,
+            envelope,
+            message_id=message_id,
+            scope="private",
+            conversation_id=conversation_id,
+            target=target.username,
+            timestamp=float(metadata["timestamp"]),
+        )
         self.storage.append_message(conversation_id, message)
         self._send(session, message)
         if target.id != session.id:
             self._send(target, message)
-        self._emit_log("message", f"[Private] {session.username} -> {target.username}: {text}")
+        self._emit_log(
+            "message",
+            f"[Private] {session.username} -> {target.username}: [encrypted message]",
+        )
 
     def _handle_private_history(self, session: ClientSession, packet: dict[str, Any]) -> None:
         target_name = str(packet.get("with", "")).strip()
@@ -518,7 +699,7 @@ class ChatServerEngine:
                 "scope": "private",
                 "conversation_id": conversation_id,
                 "with": canonical_name,
-                "messages": self.storage.load_messages(conversation_id),
+                "messages": self._load_secure_history(conversation_id),
             },
         )
 
@@ -642,31 +823,55 @@ class ChatServerEngine:
         with self._lock:
             room = self._rooms.get(room_id)
             allowed = room is not None and session.id in room.members
+            muted = bool(room and session.id in room.muted)
+            recipient_fingerprints = {
+                self._sessions[member_id].identity_fingerprint
+                for member_id in (room.members if room else set())
+                if member_id in self._sessions and self._sessions[member_id].ready
+            }
         if not allowed:
             self._send_error(session, "not_in_room", "You are not a member of that room.")
             return
-        filename = str(packet.get("name", "file"))
+        if muted:
+            self._send_error(session, "muted", "You are muted in this room.")
+            return
+        envelope = packet.get("envelope")
+        if not isinstance(envelope, dict) or session.identity_key is None:
+            self._send_error(session, "encryption_required", "A signed encrypted file is required.")
+            return
         try:
-            declared_size = int(packet.get("size", -1))
-            raw = base64.b64decode(str(packet.get("data", "")), validate=True)
-        except (ValueError, TypeError, binascii.Error):
-            self._send_error(session, "invalid_file", "File payload is not valid base64 data.")
+            raw = decode_file_ciphertext(packet.get("data"))
+            unsigned = validate_file_envelope(
+                envelope,
+                session.identity_key,
+                room_id=room_id,
+                ciphertext=raw,
+            )
+            require_exact_recipients(envelope, recipient_fingerprints)
+        except (SecurityError, SecureProtocolError, TypeError, ValueError) as exc:
+            self._send_error(session, "invalid_file", str(exc))
             return
-        if declared_size != len(raw) or len(raw) > MAX_FILE_BYTES:
-            self._send_error(session, "file_too_large", f"Files are limited to {MAX_FILE_BYTES} bytes.")
+        file_id = str(unsigned["file_id"])
+        if not self._register_envelope_id(file_id):
+            self._send_error(session, "replayed_file", "This encrypted file was already received.")
             return
-        file_id = uuid.uuid4().hex
+        uploaded_at = float(unsigned["metadata"]["timestamp"])
         try:
             stored_metadata = self.storage.save_file(
                 file_id,
-                filename,
+                "encrypted-file",
                 raw,
                 {
                     "room_id": room_id,
                     "sender": session.username,
                     "sender_id": session.id,
-                    "uploaded_at": time.time(),
+                    "sender_identity_key": session.identity_key_pem,
+                    "sender_identity_fingerprint": session.identity_fingerprint,
+                    "uploaded_at": uploaded_at,
+                    "plaintext_size": len(raw) - 16,
+                    "envelope": envelope,
                 },
+                max_bytes=MAX_ENCRYPTED_FILE_BYTES,
             )
         except (OSError, StorageError, ValueError) as exc:
             self._send_error(session, "file_storage_error", f"Could not store file: {exc}")
@@ -677,11 +882,15 @@ class ChatServerEngine:
             "room_id": room_id,
             "file": metadata,
             "sender": session.username,
-            "timestamp": metadata.get("uploaded_at", time.time()),
+            "sender_id": session.id,
+            "timestamp": uploaded_at,
         }
         self.storage.append_message(room_id, event)
         self._broadcast_room(room_id, event)
-        self._emit_log("info", f"{session.username} shared {metadata['name']} in {room.name}")
+        self._emit_log(
+            "info",
+            f"{session.username} shared an encrypted file in {room.name}",
+        )
         self._emit_snapshot()
 
     def _handle_download_file(self, session: ClientSession, packet: dict[str, Any]) -> None:
@@ -690,6 +899,13 @@ class ChatServerEngine:
             stored_metadata, data = self.storage.read_file(file_id)
         except (FileNotFoundError, KeyError, StorageError):
             self._send_error(session, "file_not_found", "The requested file no longer exists.")
+            return
+        if not self._is_secure_file_metadata(stored_metadata):
+            self._send_error(
+                session,
+                "legacy_file_unsupported",
+                "Legacy plaintext files are not served by the encrypted protocol.",
+            )
             return
         metadata = self._file_public(stored_metadata)
         room_id = str(metadata.get("room_id", ""))
@@ -738,7 +954,7 @@ class ChatServerEngine:
                 "type": "history",
                 "scope": "room",
                 "room_id": room_id,
-                "messages": self.storage.load_messages(room_id),
+                "messages": self._load_secure_history(room_id),
             },
         )
 
@@ -751,11 +967,17 @@ class ChatServerEngine:
             ]
             current_room = self._rooms.get(session.current_room, self._rooms[MAIN_ROOM_ID])
             users = [
-                self._session_for_room(self._sessions[user_id], current_room)
+                self._session_for_room(
+                    self._sessions[user_id], current_room, viewer_id=session.id
+                )
                 for user_id in current_room.members
                 if user_id in self._sessions and self._sessions[user_id].ready
             ]
-            files = [self._file_public(item) for item in self.storage.list_files(current_room.id)]
+            files = [
+                self._file_public(item)
+                for item in self.storage.list_files(current_room.id)
+                if self._is_secure_file_metadata(item)
+            ]
         self._send(
             session,
             {
@@ -835,12 +1057,16 @@ class ChatServerEngine:
         if session.closed.is_set():
             return
         session.closed.set()
+        ChatServerEngine._close_transport(session.socket)
+
+    @staticmethod
+    def _close_transport(sock: socket.socket) -> None:
         try:
-            session.socket.shutdown(socket.SHUT_RDWR)
+            sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
         try:
-            session.socket.close()
+            sock.close()
         except OSError:
             pass
 
@@ -865,6 +1091,19 @@ class ChatServerEngine:
         with self._lock:
             session_id = self._usernames.get(username.casefold())
             return self._sessions.get(session_id) if session_id else None
+
+    def _register_envelope_id(self, envelope_id: str) -> bool:
+        """Remember a bounded set of IDs and reject live replay attempts."""
+
+        with self._lock:
+            if envelope_id in self._seen_envelope_ids:
+                return False
+            self._seen_envelope_ids.add(envelope_id)
+            self._seen_envelope_order.append(envelope_id)
+            while len(self._seen_envelope_order) > 20_000:
+                expired = self._seen_envelope_order.popleft()
+                self._seen_envelope_ids.discard(expired)
+            return True
 
     @staticmethod
     def _private_conversation_id(first: str, second: str) -> str:
@@ -896,6 +1135,38 @@ class ChatServerEngine:
             "timestamp": time.time(),
         }
 
+    @staticmethod
+    def _encrypted_message_packet(
+        session: ClientSession,
+        envelope: dict[str, Any],
+        *,
+        message_id: str,
+        scope: str,
+        timestamp: float,
+        room_id: str | None = None,
+        conversation_id: str | None = None,
+        target: str | None = None,
+    ) -> dict[str, Any]:
+        packet: dict[str, Any] = {
+            "type": "message",
+            "id": message_id,
+            "scope": scope,
+            "sender": session.username,
+            "sender_id": session.id,
+            "sender_identity_key": session.identity_key_pem,
+            "sender_identity_fingerprint": session.identity_fingerprint,
+            "envelope": envelope,
+            "kind": "chat",
+            "timestamp": timestamp,
+        }
+        if room_id is not None:
+            packet["room_id"] = room_id
+        if conversation_id is not None:
+            packet["conversation_id"] = conversation_id
+        if target is not None:
+            packet["to"] = target
+        return packet
+
     def _session_public(self, session: ClientSession) -> dict[str, Any]:
         return {
             "id": session.id,
@@ -904,16 +1175,22 @@ class ChatServerEngine:
             "port": session.address[1],
             "current_room": session.current_room,
             "rooms": sorted(session.rooms),
+            "identity_key": session.identity_key_pem,
+            "identity_fingerprint": session.identity_fingerprint,
         }
 
-    def _session_for_room(self, session: ClientSession, room: Room) -> dict[str, Any]:
+    def _session_for_room(
+        self, session: ClientSession, room: Room, *, viewer_id: str = ""
+    ) -> dict[str, Any]:
         role = "owner" if room.owner_id == session.id else "admin" if session.id in room.admins else "member"
         return {
             "id": session.id,
             "username": session.username,
             "role": role,
             "muted": session.id in room.muted,
-            "self": False,
+            "self": session.id == viewer_id,
+            "identity_key": session.identity_key_pem,
+            "identity_fingerprint": session.identity_fingerprint,
         }
 
     def _room_public(self, room: Room) -> dict[str, Any]:
@@ -937,12 +1214,50 @@ class ChatServerEngine:
             "invite_code": room.invite_code if role in {"owner", "admin"} else None,
         }
 
+    def _load_secure_history(self, conversation_id: str) -> list[dict[str, Any]]:
+        """Exclude legacy user plaintext instead of downgrading the protocol."""
+
+        result: list[dict[str, Any]] = []
+        for item in self.storage.load_messages(conversation_id):
+            packet_type = str(item.get("type", "")).lower()
+            is_system = (
+                str(item.get("kind", "")).lower() == "system"
+                or str(item.get("sender_id", "")).lower() in {"system", "server"}
+            )
+            if packet_type == "message" and is_system:
+                result.append(item)
+            elif (
+                packet_type == "message"
+                and isinstance(item.get("envelope"), dict)
+                and "text" not in item
+            ):
+                result.append(item)
+            elif packet_type == "file_shared":
+                metadata = item.get("file")
+                if isinstance(metadata, dict) and self._is_secure_file_metadata(metadata):
+                    result.append(item)
+        return result
+
+    @staticmethod
+    def _is_secure_file_metadata(metadata: dict[str, Any]) -> bool:
+        envelope = metadata.get("envelope")
+        return (
+            isinstance(envelope, dict)
+            and envelope.get("kind") == "file"
+            and bool(metadata.get("sender_identity_key"))
+            and bool(metadata.get("sender_identity_fingerprint"))
+        )
+
     @staticmethod
     def _file_public(metadata: dict[str, Any]) -> dict[str, Any]:
         """Normalize storage metadata into stable wire-facing field names."""
         result = dict(metadata)
         result["id"] = str(metadata.get("file_id", metadata.get("id", "")))
-        result["name"] = str(metadata.get("original_name", metadata.get("name", "file")))
+        result["name"] = "Encrypted file"
+        result["ciphertext_size"] = int(metadata.get("size", 0))
+        result["size"] = int(
+            metadata.get("plaintext_size", max(0, result["ciphertext_size"] - 16))
+        )
         result.pop("file_id", None)
         result.pop("original_name", None)
         return result

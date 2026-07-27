@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -13,9 +14,17 @@ from PyQt6.QtWidgets import QApplication
 
 from chat_online.client_window import ClientWindow
 from chat_online.launcher import LauncherDialog
+from chat_online.secure_protocol import (
+    encode_file_ciphertext,
+    identity_fields,
+    message_envelope,
+)
+from chat_online.security import Identity, encrypt_file
+from chat_online.server import MAIN_ROOM_ID
 from chat_online.server_window import ServerWindow
 from chat_online.storage import AppStorage
 from chat_online.theme import apply_theme, configure_application_font
+from chat_online.widgets import BubbleRow
 
 
 APP = QApplication.instance() or QApplication([])
@@ -74,6 +83,7 @@ class UiSmokeTests(unittest.TestCase):
             65535,
             "Alice",
             auto_connect=False,
+            security_dir=Path(self.temporary.name) / "client-security",
         )
         window.resize(900, 600)
         window.show()
@@ -83,6 +93,197 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual(len(window.pending_packets), 1)
         self.assertEqual(len(window.message_list.packets()), 1)
         self.assertTrue(self._nonblank(window))
+        window.close()
+
+    def test_client_composer_layout_is_stable_at_supported_sizes(self) -> None:
+        window = ClientWindow(
+            "127.0.0.1",
+            65535,
+            "Alice",
+            auto_connect=False,
+            security_dir=Path(self.temporary.name) / "client-security",
+        )
+        window.show()
+        for width, height in ((900, 600), (1240, 760)):
+            window.resize(width, height)
+            APP.processEvents()
+            self.assertGreaterEqual(window.composer.height(), 62)
+            self.assertGreater(window.composer.width(), 220)
+            self.assertLess(window.composer.geometry().bottom(), window.emoji_button.geometry().top())
+            self.assertEqual(window.emoji_button.geometry().top(), window.attach_button.geometry().top())
+            self.assertLessEqual(
+                abs(
+                    window.attach_button.geometry().center().y()
+                    - window.send_button.geometry().center().y()
+                ),
+                1,
+            )
+            self.assertLessEqual(
+                window.send_button.geometry().right(),
+                window.send_button.parentWidget().contentsRect().right(),
+            )
+            self.assertTrue(self._nonblank(window))
+        window.close()
+
+    def test_system_bubble_and_file_id_are_presented_as_actions(self) -> None:
+        system = BubbleRow({"type": "system", "text": "服务器维护通知"})
+        self.assertEqual(system._bubble.property("messageRole"), "system")
+
+        received: list[dict] = []
+        file_row = BubbleRow(
+            {
+                "type": "file_shared",
+                "file": {"id": "file-1", "name": "report.txt", "size": 12},
+            }
+        )
+        file_row.fileActivated.connect(received.append)
+        file_row.show()
+        APP.processEvents()
+        self.assertFalse(file_row._file_button.isHidden())
+        file_row._file_button.click()
+        self.assertEqual(received[0]["id"], "file-1")
+        system.close()
+        file_row.close()
+
+    def test_file_bubble_download_uses_metadata_id(self) -> None:
+        window = ClientWindow(
+            "127.0.0.1",
+            65535,
+            "Alice",
+            auto_connect=False,
+            security_dir=Path(self.temporary.name) / "client-security",
+        )
+        destination = Path(self.temporary.name) / "download.txt"
+        window._send_or_warn = Mock(return_value=True)
+        window.message_list.append_message(
+            {
+                "type": "file_shared",
+                "file": {"id": "file-2", "name": "download.txt", "size": 4},
+            }
+        )
+        row = window.message_list.itemWidget(window.message_list.item(0))
+        with patch(
+            "chat_online.client_window.QFileDialog.getSaveFileName",
+            return_value=(str(destination), ""),
+        ):
+            row._file_button.click()
+        window._send_or_warn.assert_called_once_with(
+            {"type": "download_file", "file_id": "file-2"}
+        )
+        self.assertEqual(window.pending_downloads["file-2"], destination)
+        self.assertEqual(window.transfer_status.property("tone"), "info")
+        window.close()
+
+    def test_inactive_window_attention_is_throttled_and_ignores_own_echo(self) -> None:
+        window = ClientWindow(
+            "127.0.0.1",
+            65535,
+            "Alice",
+            auto_connect=False,
+            security_dir=Path(self.temporary.name) / "client-security",
+        )
+        window.session_id = "self-id"
+        window._request_attention = Mock()
+        window.hide()
+
+        incoming = {
+            "type": "message",
+            "scope": "room",
+            "room_id": MAIN_ROOM_ID,
+            "sender": "Bob",
+            "sender_id": "bob-id",
+            "text": "hello",
+        }
+        window._receive_message(incoming)
+        window._receive_message(incoming)
+        window._receive_message({**incoming, "sender_id": "self-id"})
+        window._request_attention.assert_called_once_with()
+
+        window._last_attention_at = 0.0
+        window._receive_file_shared(
+            {
+                "type": "file_shared",
+                "room_id": MAIN_ROOM_ID,
+                "file": {
+                    "id": "file-3",
+                    "name": "notes.txt",
+                    "size": 8,
+                    "sender_id": "bob-id",
+                },
+            }
+        )
+        self.assertEqual(window._request_attention.call_count, 2)
+        window.close()
+
+    def test_client_decrypts_verified_messages_and_files(self) -> None:
+        window = ClientWindow(
+            "127.0.0.1",
+            65535,
+            "Alice",
+            auto_connect=False,
+            security_dir=Path(self.temporary.name) / "client-security",
+        )
+        window.session_id = "alice-id"
+        bob = Identity.generate()
+        timestamp = 1_700_000_000.0
+        envelope = message_envelope(
+            bob,
+            [window.identity.public_key, bob.public_key],
+            "verified secret",
+            scope="room",
+            room_id=MAIN_ROOM_ID,
+            timestamp=timestamp,
+        )
+        packet = {
+            "type": "message",
+            "id": envelope["metadata"]["id"],
+            "scope": "room",
+            "room_id": MAIN_ROOM_ID,
+            "sender": "Bob",
+            "sender_id": "bob-id",
+            "kind": "chat",
+            "timestamp": timestamp,
+            "envelope": envelope,
+            **identity_fields(bob, sender=True),
+        }
+        decoded = window._decrypt_message_packet(packet)
+        self.assertEqual(decoded["text"], "verified secret")
+        self.assertTrue(decoded["encrypted"])
+
+        encrypted_file = encrypt_file(
+            b"verified file bytes",
+            "verified.txt",
+            bob.private_key,
+            [window.identity.public_key, bob.public_key],
+            authenticated_metadata={
+                "room_id": MAIN_ROOM_ID,
+                "timestamp": timestamp,
+            },
+        )
+        file_metadata = {
+            "id": encrypted_file.envelope["file_id"],
+            "name": "Encrypted file",
+            "room_id": MAIN_ROOM_ID,
+            "sender": "Bob",
+            "sender_id": "bob-id",
+            "timestamp": timestamp,
+            "envelope": encrypted_file.envelope,
+            **identity_fields(bob, sender=True),
+        }
+        normalized = window._decrypt_file_metadata(file_metadata)
+        self.assertIsNotNone(normalized)
+        self.assertEqual(normalized["name"], "verified.txt")
+
+        destination = Path(self.temporary.name) / "verified.txt"
+        window.pending_downloads[file_metadata["id"]] = destination
+        window._receive_file_data(
+            {
+                "type": "file_data",
+                "file": file_metadata,
+                "data": encode_file_ciphertext(encrypted_file.ciphertext),
+            }
+        )
+        self.assertEqual(destination.read_bytes(), b"verified file bytes")
         window.close()
 
     @staticmethod

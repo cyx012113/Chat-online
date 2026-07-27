@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
+from chat_online import cli
 from chat_online.cli import (
     CommandError,
     ParsedCommand,
@@ -159,13 +162,13 @@ class ExecuteCommandTests(unittest.TestCase):
     def test_files_supports_all_files_or_room_filter(self) -> None:
         all_files = execute_command(self.engine, "files")
         self.assertTrue(all_files.ok)
-        self.assertIn("notes.txt [file-1]", all_files.message)
+        self.assertIn("[legacy plaintext; relay disabled] [file-1]", all_files.message)
         self.assertIn("1.5 KiB", all_files.message)
 
         room_files = execute_command(self.engine, 'files "Side Room"')
         self.assertTrue(room_files.ok)
-        self.assertIn("photo.png [file-2]", room_files.message)
-        self.assertNotIn("notes.txt", room_files.message)
+        self.assertIn("[legacy plaintext; relay disabled] [file-2]", room_files.message)
+        self.assertNotIn("file-1", room_files.message)
         self.assertEqual(self.engine.storage.requested_rooms, [None, "room-2"])
 
     def test_say_and_kick_resolve_shell_text_and_username(self) -> None:
@@ -226,7 +229,13 @@ class ExecuteCommandTests(unittest.TestCase):
     def test_blank_command_is_a_successful_noop(self) -> None:
         self.assertEqual(execute_command(self.engine, "" ).message, "")
 
+    def test_console_eof_disables_input_without_stopping_server(self) -> None:
+        bridge = Mock()
+        runtime = SimpleNamespace(stopping=False)
+        with patch("builtins.input", side_effect=EOFError):
+            cli._console_input_loop(bridge, runtime)
+        bridge.shutdown_requested.emit.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
-

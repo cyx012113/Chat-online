@@ -7,12 +7,24 @@ from copy import deepcopy
 from datetime import datetime
 import html
 import re
+import shlex
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
-from PyQt6.QtCore import QSize, Qt, QUrl, pyqtSignal
+from markdown_it import MarkdownIt
+from mdit_py_plugins.container import container_plugin
+from mdit_py_plugins.dollarmath import dollarmath_plugin
+from mdit_py_plugins.tasklists import tasklists_plugin
+from pygments import highlight
+from pygments.formatters import HtmlFormatter
+from pygments.lexers import TextLexer, get_lexer_by_name
+from pygments.util import ClassNotFound
+
+from PyQt6.QtCore import QEvent, QSize, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QResizeEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -26,7 +38,6 @@ from PyQt6.QtWidgets import (
 )
 
 
-_URL_RE = re.compile(r"(?i)(?:https?://|www\.)[^\s<>\"']+")
 _SYSTEM_PACKET_TYPES = {
     "error",
     "kicked",
@@ -34,6 +45,7 @@ _SYSTEM_PACKET_TYPES = {
     "server_shutdown",
     "system",
 }
+_FILE_PACKET_TYPES = {"file_shared", "encrypted_file_shared"}
 
 
 def _copy_packet(packet: Mapping[str, Any]) -> dict[str, Any]:
@@ -95,25 +107,381 @@ def _trim_url_suffix(value: str) -> tuple[str, str]:
     return value, trailing
 
 
-def _escape_text(value: str) -> str:
-    return html.escape(value, quote=False).replace("\n", "<br>")
+def _theme_is_dark() -> bool:
+    app = QApplication.instance()
+    return bool(app is not None and app.property("theme") == "dark")
 
 
-def _linkify(value: str) -> str:
-    chunks: list[str] = []
-    position = 0
-    for match in _URL_RE.finditer(value):
-        chunks.append(_escape_text(value[position : match.start()]))
-        visible, trailing = _trim_url_suffix(match.group(0))
-        target = visible if visible.lower().startswith(("http://", "https://")) else f"https://{visible}"
-        chunks.append(
-            f'<a href="{html.escape(target, quote=True)}">'
-            f"{html.escape(visible, quote=False)}</a>"
+def _safe_web_url(value: object, *, https_only: bool = False) -> str | None:
+    candidate = html.unescape(str(value or "")).strip()
+    if not candidate or any(ord(character) < 32 for character in candidate):
+        return None
+    try:
+        parsed = urlsplit(candidate)
+        port = parsed.port
+    except ValueError:
+        return None
+    allowed = {"https"} if https_only else {"http", "https"}
+    if parsed.scheme.lower() not in allowed or not parsed.hostname or port is None and ":" in parsed.netloc.rsplit("@", 1)[-1] and parsed.netloc.endswith(":"):
+        return None
+    return candidate
+
+
+def _bilibili_url(value: str) -> str | None:
+    if not value.lower().startswith("bilibili:"):
+        return None
+    spec = value.split(":", 1)[1].strip()
+    video_id, separator, query = spec.partition("?")
+    if video_id.isdigit():
+        video_id = f"av{video_id}"
+    elif re.fullmatch(r"(?i)av\d+", video_id):
+        video_id = f"av{video_id[2:]}"
+    elif not re.fullmatch(r"(?i)BV[0-9A-Za-z]+", video_id):
+        return None
+
+    safe_query: list[tuple[str, str]] = []
+    if separator:
+        for key, item in parse_qsl(query, keep_blank_values=False):
+            normalized = "p" if key == "page" else key
+            if normalized not in {"p", "t"} or not item.isdigit():
+                continue
+            safe_query.append((normalized, item))
+    suffix = f"?{urlencode(safe_query)}" if safe_query else ""
+    return f"https://www.bilibili.com/video/{video_id}{suffix}"
+
+
+def _markdown_colors() -> dict[str, str]:
+    if _theme_is_dark():
+        return {
+            "muted": "#AAB2BD",
+            "border": "#4A515C",
+            "surface": "#292D33",
+            "surface_alt": "#202328",
+            "highlight": "#514819",
+            "code": "#F3F4F6",
+            "info": "#7DB4FF",
+            "success": "#4ADE80",
+            "warning": "#FBBF24",
+            "error": "#F87171",
+        }
+    return {
+        "muted": "#667085",
+        "border": "#D8DEE6",
+        "surface": "#F0F2F5",
+        "surface_alt": "#FFFFFF",
+        "highlight": "#FFF2A8",
+        "code": "#1B1F24",
+        "info": "#2563EB",
+        "success": "#16803C",
+        "warning": "#B7791F",
+        "error": "#C73535",
+    }
+
+
+def _parse_fence_info(value: str) -> tuple[str, bool, tuple[int, int] | None]:
+    try:
+        parts = shlex.split(value, posix=True)
+    except ValueError:
+        parts = value.split()
+    language = ""
+    numbered = False
+    highlighted: tuple[int, int] | None = None
+    for part in parts:
+        if part == "line-numbers":
+            numbered = True
+            continue
+        match = re.fullmatch(r"lines=(\d+)-(\d+)", part)
+        if match:
+            start, end = (int(match.group(1)), int(match.group(2)))
+            if start > 0 and end > 0:
+                highlighted = (min(start, end), max(start, end))
+            continue
+        if not language and re.fullmatch(r"[A-Za-z0-9_+.#-]{1,40}", part):
+            language = part
+    return language, numbered, highlighted
+
+
+def _render_fence(code: str, info: str) -> str:
+    language, numbered, highlighted_range = _parse_fence_info(info)
+    display_language = language or "cpp"
+    try:
+        lexer = get_lexer_by_name(display_language)
+    except ClassNotFound:
+        lexer = TextLexer()
+    style = "monokai" if _theme_is_dark() else "friendly"
+    formatter = HtmlFormatter(nowrap=True, noclasses=True, style=style)
+    rendered = highlight(code, lexer, formatter)
+    lines = rendered.split("\n")
+    if code.endswith("\n") and lines and lines[-1] == "":
+        lines.pop()
+    if not lines:
+        lines = [""]
+
+    colors = _markdown_colors()
+    number_width = len(str(max(1, len(lines))))
+    body: list[str] = []
+    for number, line in enumerate(lines, start=1):
+        prefix = ""
+        if numbered:
+            label = str(number).rjust(number_width).replace(" ", "&#160;")
+            prefix = (
+                f'<span style="color:{colors["muted"]};">{label} &#160;</span>'
+            )
+        is_highlighted = bool(
+            highlighted_range
+            and highlighted_range[0] <= number <= highlighted_range[1]
         )
-        chunks.append(_escape_text(trailing))
-        position = match.end()
-    chunks.append(_escape_text(value[position:]))
-    return "".join(chunks)
+        background = colors["highlight"] if is_highlighted else "transparent"
+        body.append(
+            f'<span data-line="{number}" style="background-color:{background};">'
+            f"{prefix}{line or '&#8203;'}</span>"
+        )
+    language_label = html.escape(display_language, quote=False)
+    code_body = "\n".join(body)
+    return (
+        f'<div class="md-code-block" data-language="{html.escape(display_language, quote=True)}" '
+        f'style="margin:5px 0;border:1px solid {colors["border"]};">'
+        f'<div style="padding:3px 7px;color:{colors["muted"]};'
+        f'background-color:{colors["surface"]};font-size:8pt;">{language_label}</div>'
+        f'<pre style="margin:0;padding:7px;color:{colors["code"]};'
+        f'background-color:{colors["surface_alt"]};white-space:pre-wrap;'
+        f'word-wrap:break-word;overflow-wrap:anywhere;">'
+        f"{code_body}</pre></div>\n"
+    )
+
+
+def _container_title(info: str, name: str) -> tuple[str, bool]:
+    match = re.fullmatch(
+        rf"\s*{re.escape(name)}(?:\[(.*?)\])?\s*(\{{open\}})?\s*",
+        info,
+    )
+    if not match:
+        return "", False
+    return (match.group(1) or "").strip(), bool(match.group(2))
+
+
+def _build_markdown_renderer() -> MarkdownIt:
+    markdown = MarkdownIt(
+        "commonmark",
+        {"html": False, "linkify": True, "typographer": False, "breaks": False},
+    ).enable(["table", "strikethrough", "linkify"])
+    # Tokenize every explicit destination so our renderer can replace unsafe
+    # links and images with inert text instead of leaking raw Markdown syntax.
+    markdown.validateLink = lambda _url: True
+    markdown.use(tasklists_plugin, enabled=False, label=False)
+    markdown.use(
+        dollarmath_plugin,
+        allow_labels=False,
+        allow_space=True,
+        allow_digits=True,
+        allow_blank_lines=True,
+    )
+
+    def validate_align(params: str, _markup: str) -> bool:
+        return re.fullmatch(r"\s*align\{(?:center|right)\}\s*", params) is not None
+
+    def render_align(self, tokens, index, _options, _env) -> str:
+        token = tokens[index]
+        if token.nesting < 0:
+            return "</div>\n"
+        match = re.fullmatch(r"\s*align\{(center|right)\}\s*", token.info)
+        alignment = match.group(1) if match else "center"
+        return f'<div class="md-align-{alignment}" align="{alignment}">\n'
+
+    markdown.use(
+        container_plugin,
+        "align",
+        validate=validate_align,
+        render=render_align,
+    )
+
+    def validate_epigraph(params: str, _markup: str) -> bool:
+        return re.fullmatch(r"\s*epigraph(?:\[.*?\])?\s*", params) is not None
+
+    def render_epigraph(self, tokens, index, _options, env) -> str:
+        token = tokens[index]
+        authors = env.setdefault("_md_epigraph_authors", [])
+        colors = _markdown_colors()
+        if token.nesting > 0:
+            author, _open = _container_title(token.info, "epigraph")
+            authors.append(author)
+            return (
+                f'<blockquote class="md-epigraph" style="margin:5px 0;padding:4px 9px;'
+                f'border-left:3px solid {colors["border"]};">\n'
+            )
+        author = authors.pop() if authors else ""
+        footer = (
+            f'<p align="right" style="color:{colors["muted"]};">'
+            f'-- {html.escape(author, quote=False)}</p>\n'
+            if author
+            else ""
+        )
+        return f"{footer}</blockquote>\n"
+
+    markdown.use(
+        container_plugin,
+        "epigraph",
+        validate=validate_epigraph,
+        render=render_epigraph,
+    )
+
+    tone_labels = {
+        "info": "提示",
+        "success": "成功",
+        "warning": "警告",
+        "error": "错误",
+    }
+    for tone, default_title in tone_labels.items():
+        def validate_admonition(
+            params: str,
+            _markup: str,
+            *,
+            expected: str = tone,
+        ) -> bool:
+            return re.fullmatch(
+                rf"\s*{re.escape(expected)}(?:\[.*?\])?\s*(?:\{{open\}})?\s*",
+                params,
+            ) is not None
+
+        def render_admonition(
+            self,
+            tokens,
+            index,
+            _options,
+            _env,
+            *,
+            expected: str = tone,
+            fallback_title: str = default_title,
+        ) -> str:
+            token = tokens[index]
+            if token.nesting < 0:
+                return "</td></tr></table>\n"
+            title, opened = _container_title(token.info, expected)
+            colors = _markdown_colors()
+            accent = colors[expected]
+            heading = html.escape(title or fallback_title, quote=False)
+            return (
+                f'<table class="md-admonition md-{expected}" data-open="{str(opened).lower()}" '
+                f'cellspacing="0" cellpadding="6" width="100%" '
+                f'style="margin:5px 0;border:1px solid {accent};">'
+                f'<tr><td><b style="color:{accent};">{heading}</b><br>'
+            )
+
+        markdown.use(
+            container_plugin,
+            tone,
+            validate=validate_admonition,
+            render=render_admonition,
+        )
+
+    def render_fence(self, tokens, index, _options, _env) -> str:
+        token = tokens[index]
+        return _render_fence(token.content, token.info)
+
+    def render_image(self, tokens, index, _options, _env) -> str:
+        token = tokens[index]
+        source = str(token.attrGet("src") or "")
+        alt = token.content.strip() or "图片"
+        bilibili = _bilibili_url(source)
+        destination = bilibili or _safe_web_url(source, https_only=True)
+        visible = f"[{'Bilibili 视频' if bilibili else '图片'}：{alt}]"
+        escaped_visible = html.escape(visible, quote=False)
+        if not destination:
+            return f'<span class="md-blocked-image">{escaped_visible}（链接已拦截）</span>'
+        title = str(token.attrGet("title") or alt)
+        return (
+            f'<a class="md-image-link" href="{html.escape(destination, quote=True)}" '
+            f'title="{html.escape(title, quote=True)}">{escaped_visible}</a>'
+        )
+
+    def render_link_open(self, tokens, index, _options, env) -> str:
+        token = tokens[index]
+        target = _safe_web_url(token.attrGet("href"))
+        unsafe_links = env.setdefault("_md_unsafe_links", [])
+        unsafe_links.append(target is None)
+        if target is None:
+            return '<span class="md-blocked-link">'
+        title = token.attrGet("title")
+        title_attr = (
+            f' title="{html.escape(str(title), quote=True)}"' if title else ""
+        )
+        return (
+            f'<a href="{html.escape(target, quote=True)}"{title_attr} '
+            'style="text-decoration:underline;">'
+        )
+
+    def render_link_close(self, _tokens, _index, _options, env) -> str:
+        unsafe_links = env.setdefault("_md_unsafe_links", [])
+        unsafe = unsafe_links.pop() if unsafe_links else False
+        return "</span>" if unsafe else "</a>"
+
+    def render_html_inline(self, tokens, index, _options, _env) -> str:
+        content = tokens[index].content
+        if "task-list-item-checkbox" not in content:
+            return html.escape(content, quote=False)
+        checked = 'checked="checked"' in content
+        marker = "&#x2611;" if checked else "&#x2610;"
+        return f'<span class="md-task-marker">{marker}</span>'
+
+    def render_math_inline(self, tokens, index, _options, _env) -> str:
+        content = html.escape(tokens[index].content, quote=False)
+        return f'<span class="md-math">&#36;{content}&#36;</span>'
+
+    def render_math_block(self, tokens, index, _options, _env) -> str:
+        content = html.escape(tokens[index].content, quote=False).replace("\n", "<br>")
+        return f'<div class="md-math-block">&#36;&#36;<br>{content}<br>&#36;&#36;</div>\n'
+
+    markdown.add_render_rule("fence", render_fence)
+    markdown.add_render_rule("image", render_image)
+    markdown.add_render_rule("link_open", render_link_open)
+    markdown.add_render_rule("link_close", render_link_close)
+    markdown.add_render_rule("html_inline", render_html_inline)
+    markdown.add_render_rule("math_inline", render_math_inline)
+    markdown.add_render_rule("math_block", render_math_block)
+    return markdown
+
+
+_MARKDOWN = _build_markdown_renderer()
+
+
+def _render_markdown(value: object) -> str:
+    source = str(value or "")
+    source = re.sub(
+        r"(?m)^[ \t]*::cute-table\{tuack\}[ \t]*(?:\r?\n|$)",
+        "",
+        source,
+    )
+    colors = _markdown_colors()
+    rendered = _MARKDOWN.render(source, {})
+    style = f"""
+<style>
+.md-root {{ margin: 0; padding: 0; }}
+.md-root p {{ margin: 3px 0; }}
+.md-root h1 {{ font-size: 15pt; margin: 5px 0 3px 0; }}
+.md-root h2 {{ font-size: 14pt; margin: 5px 0 3px 0; }}
+.md-root h3 {{ font-size: 13pt; margin: 4px 0 2px 0; }}
+.md-root h4 {{ font-size: 12pt; margin: 4px 0 2px 0; }}
+.md-root h5 {{ font-size: 11pt; margin: 3px 0 2px 0; }}
+.md-root h6 {{ font-size: 10pt; margin: 3px 0 2px 0; color: {colors['muted']}; }}
+.md-root blockquote {{ margin: 4px 0 4px 6px; padding-left: 8px; border-left: 3px solid {colors['border']}; }}
+.md-root pre, .md-root code {{ font-family: Consolas, "Cascadia Mono", monospace; }}
+.md-root code {{ background-color: {colors['surface']}; white-space: pre-wrap; }}
+.md-root ul, .md-root ol {{ margin: 3px 0 3px 18px; padding: 0; }}
+.md-root li {{ margin: 1px 0; }}
+.md-root table {{ border-collapse: collapse; margin: 5px 0; }}
+.md-root th {{ background-color: {colors['surface']}; font-weight: bold; }}
+.md-root th, .md-root td {{ border: 1px solid {colors['border']}; padding: 4px 6px; }}
+.md-root hr {{ color: {colors['border']}; }}
+.md-math, .md-math-block {{ color: {colors['code']}; background-color: {colors['surface']}; font-family: serif; }}
+.md-blocked-link, .md-blocked-image {{ color: {colors['muted']}; }}
+</style>
+"""
+    return f'{style}<div class="md-root">{rendered}</div>'
+
+
+def _render_plain_message(value: object) -> str:
+    escaped = html.escape(str(value or ""), quote=False).replace("\n", "<br>")
+    return f'<div class="md-root"><p>{escaped}</p></div>'
 
 
 def _is_system_packet(packet: Mapping[str, Any]) -> bool:
@@ -125,7 +493,7 @@ def _is_system_packet(packet: Mapping[str, Any]) -> bool:
 
 
 def _message_text(packet: Mapping[str, Any]) -> str:
-    if str(packet.get("type", "")).lower() == "file_shared":
+    if str(packet.get("type", "")).lower() in _FILE_PACKET_TYPES:
         metadata = packet.get("file")
         file_info = metadata if isinstance(metadata, Mapping) else {}
         name = (
@@ -134,7 +502,7 @@ def _message_text(packet: Mapping[str, Any]) -> str:
             or file_info.get("filename")
             or "Unnamed file"
         )
-        return f"Shared file: {name}\n{_format_size(file_info.get('size'))}"
+        return f"共享文件：{name}\n{_format_size(file_info.get('size'))}"
     return str(packet.get("text") or packet.get("message") or "")
 
 
@@ -239,6 +607,11 @@ class BubbleRow(QWidget):
         self._body.setObjectName("messageBody")
         self._body.setTextFormat(Qt.TextFormat.RichText)
         self._body.setWordWrap(True)
+        self._body.setMinimumWidth(0)
+        self._body.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Preferred,
+        )
         self._body.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
             | Qt.TextInteractionFlag.LinksAccessibleByMouse
@@ -249,12 +622,12 @@ class BubbleRow(QWidget):
         self._body.linkActivated.connect(self._activate_url)
         self._bubble_layout.addWidget(self._body)
 
-        self._file_button = QPushButton("Download", self._bubble)
+        self._file_button = QPushButton("下载", self._bubble)
         self._file_button.setProperty("ghost", True)
         self._file_button.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton)
         )
-        self._file_button.setToolTip("Download shared file")
+        self._file_button.setToolTip("下载共享文件")
         self._file_button.setSizePolicy(
             QSizePolicy.Policy.Maximum,
             QSizePolicy.Policy.Fixed,
@@ -288,16 +661,24 @@ class BubbleRow(QWidget):
 
         sender = str(
             self._packet.get("sender")
-            or ("System" if role == "system" else "Unknown")
+            or ("服务器" if role == "system" else "未知用户")
         )
         self._sender_text = sender
         self._update_sender_label()
         self._time.setText(_timestamp_text(self._packet.get("timestamp")))
-        self._body.setText(_linkify(_message_text(self._packet)))
 
-        is_file = str(self._packet.get("type", "")).lower() == "file_shared"
+        is_file = str(self._packet.get("type", "")).lower() in _FILE_PACKET_TYPES
+        message_text = _message_text(self._packet)
+        if is_file:
+            self._body.setProperty("sourceMarkdown", None)
+            self._body.setText(_render_plain_message(message_text))
+        else:
+            self._body.setProperty("sourceMarkdown", message_text)
+            self._body.setText(_render_markdown(message_text))
         metadata = self._packet.get("file")
-        has_file_id = isinstance(metadata, Mapping) and bool(metadata.get("file_id"))
+        has_file_id = isinstance(metadata, Mapping) and bool(
+            metadata.get("id") or metadata.get("file_id")
+        )
         self._file_button.setVisible(is_file and has_file_id)
         self._bubble.setProperty("messageRole", role)
         self._bubble.setProperty("isFile", is_file)
@@ -305,6 +686,19 @@ class BubbleRow(QWidget):
         self._rebuild_alignment(role)
         self._repolish(self._bubble)
         self.updateGeometry()
+
+    def changeEvent(self, event: QEvent) -> None:  # noqa: N802 - Qt API name
+        super().changeEvent(event)
+        if event.type() not in {
+            QEvent.Type.PaletteChange,
+            QEvent.Type.ApplicationPaletteChange,
+        }:
+            return
+        if not hasattr(self, "_body"):
+            return
+        source = self._body.property("sourceMarkdown")
+        if isinstance(source, str):
+            self._body.setText(_render_markdown(source))
 
     def set_maximum_bubble_width(self, width: int) -> None:
         normalized = max(140, int(width))
@@ -416,6 +810,25 @@ class MessageList(QListWidget):
         self._refresh_widths()
         if follow_tail:
             self.scrollToBottom()
+
+    def upsert_message(self, packet: Mapping[str, Any]) -> None:
+        """Replace a pending message with its server echo, or append it."""
+
+        copied = _copy_packet(packet)
+        message_id = str(copied.get("id", ""))
+        if message_id:
+            for index, existing in enumerate(self._packets):
+                if str(existing.get("id", "")) != message_id:
+                    continue
+                self._packets[index] = copied
+                item = self.item(index)
+                row = self.itemWidget(item)
+                if isinstance(row, BubbleRow):
+                    row.refresh(copied, self._identity)
+                self._apply_item_filter(index)
+                self._refresh_widths()
+                return
+        self.append_message(copied)
 
     def set_messages(self, packets: Iterable[Mapping[str, Any]]) -> None:
         if isinstance(packets, (str, bytes, bytearray)):

@@ -234,7 +234,8 @@ class ServerWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 8, 0, 0)
         actions = QHBoxLayout()
-        self.save_file_button = QPushButton("另存为")
+        self.save_file_button = QPushButton("导出密文")
+        self.save_file_button.setToolTip("端到端加密文件只能由收件人客户端解密")
         self.save_file_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
         self.save_file_button.clicked.connect(self._save_selected_file)
         self.delete_file_button = QPushButton("删除")
@@ -404,9 +405,12 @@ class ServerWindow(QMainWindow):
         self.files_table.setRowCount(len(files))
         for row, metadata in enumerate(files):
             uploaded = time.strftime("%Y-%m-%d %H:%M", time.localtime(metadata.get("uploaded_at", 0)))
+            encrypted = isinstance(metadata.get("envelope"), dict)
             values = (
-                metadata.get("name", metadata.get("original_name", "")),
-                self._format_size(int(metadata.get("size", 0))),
+                "加密文件" if encrypted else "旧版文件（不可中继）",
+                self._format_size(
+                    int(metadata.get("plaintext_size", metadata.get("size", 0)))
+                ),
                 metadata.get("sender", ""),
                 room_names.get(metadata.get("room_id"), metadata.get("room_id", "")),
                 uploaded,
@@ -518,18 +522,18 @@ class ServerWindow(QMainWindow):
         metadata = self._selected_data(self.files_table)
         if not metadata:
             return
-        display_name = metadata.get("name", metadata.get("original_name", "file"))
-        path, _ = QFileDialog.getSaveFileName(self, "保存文件", display_name)
+        file_id = str(metadata.get("id", metadata.get("file_id", "")))
+        display_name = f"{file_id or 'encrypted-file'}.ciphertext"
+        path, _ = QFileDialog.getSaveFileName(self, "导出加密文件", display_name)
         if not path:
             return
         try:
-            file_id = metadata.get("id", metadata.get("file_id", ""))
             _info, data = self.engine.storage.read_file(file_id)
             Path(path).write_bytes(data)
         except OSError as exc:
             self._show_error(f"保存失败：{exc}")
             return
-        self.statusBar().showMessage(f"已保存到 {path}", 4000)
+        self.statusBar().showMessage(f"密文已导出到 {path}", 4000)
 
     def _delete_selected_file(self) -> None:
         metadata = self._selected_data(self.files_table)

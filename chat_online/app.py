@@ -115,6 +115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             username=clean_username,
             theme=theme,
             auto_connect=not args.no_auto_start,
+            security_dir=storage.root / "security",
         )
     window.setWindowIcon(app_icon())
     window.show()

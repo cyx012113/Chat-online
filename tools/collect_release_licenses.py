@@ -11,7 +11,22 @@ import shutil
 import sys
 
 
-RUNTIME_DISTRIBUTIONS = ("PyQt6", "PyQt6-Qt6", "PyQt6-sip", "PyInstaller", "altgraph")
+RUNTIME_DISTRIBUTIONS = (
+    "PyQt6",
+    "PyQt6-Qt6",
+    "PyQt6-sip",
+    "cryptography",
+    "cffi",
+    "pycparser",
+    "markdown-it-py",
+    "mdit-py-plugins",
+    "Pygments",
+    "linkify-it-py",
+    "mdurl",
+    "uc-micro-py",
+    "PyInstaller",
+    "altgraph",
+)
 LICENSE_MARKERS = ("license", "licence", "copying", "notice", "authors")
 
 
@@ -82,4 +97,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -40,6 +40,9 @@ _PALETTES: Final[dict[str, dict[str, str]]] = {
         "success_soft": "#DCFCE7",
         "warning": "#B7791F",
         "warning_soft": "#FEF3C7",
+        "system_bg": "#FFF8E7",
+        "system_border": "#D9B55B",
+        "system_text": "#6B4B16",
         "danger": "#C73535",
         "danger_hover": "#A92525",
         "danger_soft": "#FEE2E2",
@@ -68,6 +71,9 @@ _PALETTES: Final[dict[str, dict[str, str]]] = {
         "success_soft": "#173B28",
         "warning": "#FBBF24",
         "warning_soft": "#493817",
+        "system_bg": "#312A1B",
+        "system_border": "#8D7134",
+        "system_text": "#F4D58D",
         "danger": "#F87171",
         "danger_hover": "#FCA5A5",
         "danger_soft": "#4A2024",
@@ -360,6 +366,16 @@ QListWidget#messageList::item:selected {{
     padding: 0;
 }}
 
+QFrame#composerBand {{
+    background-color: {colors['surface_alt']};
+    border: 1px solid {colors['border']};
+    border-radius: 8px;
+}}
+
+QFrame#composerBand QPlainTextEdit#composer {{
+    background-color: {colors['surface']};
+}}
+
 QHeaderView::section {{
     color: {colors['muted']};
     background-color: {colors['surface_alt']};
@@ -510,8 +526,14 @@ QFrame#messageBubble[messageRole="self"] {{
 }}
 
 QFrame#messageBubble[messageRole="system"] {{
-    background-color: transparent;
-    border-color: transparent;
+    background-color: {colors['system_bg']};
+    border-color: {colors['system_border']};
+    border-left: 3px solid {colors['system_border']};
+}}
+
+QFrame#messageBubble[messageRole="system"] QLabel#messageMeta,
+QFrame#messageBubble[messageRole="system"] QLabel#messageBody {{
+    color: {colors['system_text']};
 }}
 
 QFrame#messageBubble[isFile="true"] {{
@@ -526,6 +548,40 @@ QLabel#messageMeta {{
 QLabel#messageBody {{
     color: {colors['text']};
     background-color: transparent;
+    min-width: 0;
+}}
+
+QLabel#transferStatus {{
+    min-height: 20px;
+    padding: 2px 6px;
+    color: {colors['muted']};
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+}}
+
+QLabel#transferStatus[tone="info"] {{
+    color: {colors['accent']};
+    background-color: {colors['accent_soft']};
+    border-color: {colors['accent_soft_hover']};
+}}
+
+QLabel#transferStatus[tone="success"] {{
+    color: {colors['success']};
+    background-color: {colors['success_soft']};
+    border-color: {colors['success']};
+}}
+
+QLabel#transferStatus[tone="warning"] {{
+    color: {colors['warning']};
+    background-color: {colors['warning_soft']};
+    border-color: {colors['warning']};
+}}
+
+QLabel#transferStatus[tone="danger"] {{
+    color: {colors['danger']};
+    background-color: {colors['danger_soft']};
+    border-color: {colors['danger']};
 }}
 
 QLabel#statusPill {{

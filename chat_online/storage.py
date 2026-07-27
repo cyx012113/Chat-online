@@ -276,17 +276,26 @@ class AppStorage:
         original_name: str,
         data: bytes,
         metadata: dict[str, Any] | None = None,
+        *,
+        max_bytes: int | None = None,
     ) -> dict[str, Any]:
         """Atomically save a bounded attachment and return public metadata."""
 
         identifier = _validate_identifier(file_id, "file_id")
         safe_name = _sanitize_filename(original_name)
+        selected_limit = MAX_FILE_BYTES if max_bytes is None else max_bytes
+        if (
+            isinstance(selected_limit, bool)
+            or not isinstance(selected_limit, int)
+            or selected_limit < 1
+        ):
+            raise ValueError("max_bytes must be a positive integer")
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError("data must be bytes-like")
         payload = bytes(data)
-        if len(payload) > MAX_FILE_BYTES:
+        if len(payload) > selected_limit:
             raise ValueError(
-                f"file is {len(payload)} bytes; maximum is {MAX_FILE_BYTES}"
+                f"file is {len(payload)} bytes; maximum is {selected_limit}"
             )
         custom = (
             {} if metadata is None else _validate_json_object(metadata, "metadata")
@@ -396,4 +405,3 @@ class AppStorage:
                 records.append(self._public_metadata(record))
         records.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
         return records
-
